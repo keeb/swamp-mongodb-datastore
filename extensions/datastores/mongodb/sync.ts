@@ -9,6 +9,7 @@ import {
 export interface DatastoreSyncService {
   pullChanged(): Promise<number>;
   pushChanged(): Promise<number>;
+  markDirty(): Promise<void>;
 }
 
 // Mirrors swamp core's DEFAULT_DATASTORE_SUBDIRS — the subdirs under the
@@ -164,6 +165,13 @@ export function createSyncService(
       }
 
       return changes;
+    },
+
+    markDirty(): Promise<void> {
+      // No fast-path watermark to invalidate — pushChanged always walks
+      // the cache. If a future optimization adds a clean/dirty sidecar,
+      // flip it to dirty here.
+      return Promise.resolve();
     },
   };
 }
