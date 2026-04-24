@@ -5,7 +5,10 @@
   },
   "lint": {
     "include": ["extensions/"],
-    "exclude": [".swamp/"]
+    "exclude": [".swamp/"],
+    "rules": {
+      "exclude": ["no-import-prefix"]
+    }
   },
   "tasks": {
     "check": "deno check extensions/datastores/mongodb/mod.ts",

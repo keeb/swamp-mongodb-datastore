@@ -13,6 +13,10 @@
 # Local secrets for the mongodb datastore extension
 .env
 
+# Extension npm deps are bundled at build time, not lockfile-tracked
+# (per SWAMP.md rule 7). Deno writes deno.lock locally; we don't ship it.
+deno.lock
+
 # Author's working notes and auto-memory copies; not for public release
 design/
 issues/

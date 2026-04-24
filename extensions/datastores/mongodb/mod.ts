@@ -4,6 +4,16 @@ import { createVerifier } from "./verifier.ts";
 import { createLock, type LockOptions } from "./lock.ts";
 import { createSyncService } from "./sync.ts";
 
+/**
+ * Swamp `DatastoreProvider` for MongoDB.
+ *
+ * Wires distributed locking (`createLock`), replica-set health checks
+ * (`createVerifier`), and GridFS-backed byte sync of the datastore tier
+ * (`createSyncService`). Scoped per tenant + repo namespace so many
+ * consumers can share one MongoDB cluster.
+ *
+ * Config is parsed from `ConfigSchema` — see `./config.ts`.
+ */
 export const datastore = {
   type: "@keeb/mongodb-datastore",
   name: "MongoDB",
