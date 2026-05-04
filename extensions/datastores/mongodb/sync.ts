@@ -5,11 +5,22 @@ import {
   gridfsBucketName,
   type MongoDatastoreConfig,
 } from "./config.ts";
+import { Sidecar, type SidecarState } from "./sidecar.ts";
+
+export interface DatastoreSyncOptions {
+  signal?: AbortSignal;
+  // Cache-relative path (forward-slash) of the file about to be written or
+  // removed. Set by swamp-core on per-path markDirty calls; undefined for
+  // bulk mutations (rename, collectGarbage). No defined meaning on
+  // pullChanged / pushChanged — present on the shared options bag for
+  // source compatibility (see swamp-club#232 rule 7).
+  relPath?: string;
+}
 
 export interface DatastoreSyncService {
-  pullChanged(): Promise<number>;
-  pushChanged(): Promise<number>;
-  markDirty(): Promise<void>;
+  pullChanged(options?: DatastoreSyncOptions): Promise<number>;
+  pushChanged(options?: DatastoreSyncOptions): Promise<number>;
+  markDirty(options?: DatastoreSyncOptions): Promise<void>;
 }
 
 // Mirrors swamp core's DEFAULT_DATASTORE_SUBDIRS — the subdirs under the
@@ -53,6 +64,9 @@ export function createSyncService(
   repoDir: string,
   cachePath: string,
 ): DatastoreSyncService {
+  const sidecar = new Sidecar(cachePath);
+  let updatedAtIndexEnsured = false;
+
   async function resources(): Promise<{
     meta: Collection<FileMetaDoc>;
     bucket: GridFSBucket;
@@ -61,6 +75,10 @@ export function createSyncService(
     const db = client.db(cfg.database);
     const meta = db.collection<FileMetaDoc>(fsMetaCollectionName(cfg));
     const bucket = new GridFSBucket(db, { bucketName: gridfsBucketName(cfg) });
+    if (!updatedAtIndexEnsured) {
+      await meta.createIndex({ updatedAt: 1 }).catch(() => undefined);
+      updatedAtIndexEnsured = true;
+    }
     return { meta, bucket };
   }
 
@@ -81,56 +99,168 @@ export function createSyncService(
     return out;
   }
 
-  return {
-    async pushChanged(): Promise<number> {
-      const { meta, bucket } = await resources();
-      const local = await walkLocal();
-      const remote = await loadMeta(meta);
-      let changes = 0;
+  // Push a single relPath signal. relPath can be:
+  //   - a file (yaml repo writes, finalizeVersion) — push exactly that one
+  //   - a directory subtree (data-name dir from save/append/allocateVersion,
+  //     version dir from delete-version) — push every file under it that
+  //     differs from remote; safe-tombstone files remote has under the
+  //     prefix that local doesn't, subject to the lastPulledAt watermark
+  //     check (same gate fullWalkPush uses to avoid clobbering another
+  //     writer's data).
+  //   - absent — tombstone anything remote has under the prefix (with the
+  //     same watermark gate).
+  async function pushOneRel(
+    meta: Collection<FileMetaDoc>,
+    bucket: GridFSBucket,
+    relPath: string,
+    lastPulledAt: string | null,
+  ): Promise<number> {
+    const absPath = `${cachePath}/${relPath}`;
 
-      for (const [relPath, file] of local) {
-        const existing = remote.get(relPath);
-        if (
-          existing &&
-          existing.deletedAt === null &&
-          existing.hash === file.hash
-        ) continue;
+    let stat: Deno.FileInfo | null = null;
+    try {
+      stat = await Deno.stat(absPath);
+    } catch (err) {
+      if (!(err instanceof Deno.errors.NotFound)) throw err;
+    }
 
-        const absPath = `${cachePath}/${relPath}`;
-        let bytes: Uint8Array;
-        try {
-          bytes = await Deno.readFile(absPath);
-        } catch (err) {
-          // The walk saw this file; a concurrent write (e.g. SQLite
-          // rotating a -wal file) may have removed it before upload.
-          // Treat as transiently absent and let the next sync pick it up.
-          if (err instanceof Deno.errors.NotFound) continue;
-          throw err;
-        }
-        const newId = await uploadBytes(bucket, relPath, bytes);
+    const local = new Map<string, LocalFile>();
+    if (stat?.isFile) {
+      const bytes = await Deno.readFile(absPath);
+      local.set(relPath, {
+        hash: await sha256Hex(bytes),
+        size: bytes.byteLength,
+      });
+    } else if (stat?.isDirectory) {
+      await walkInto(absPath, relPath, local);
+    }
 
-        await meta.updateOne(
-          { _id: relPath },
-          {
-            $set: {
-              hash: file.hash,
-              size: file.size,
-              gridfsFileId: newId,
-              updatedAt: new Date(),
-              deletedAt: null,
-            },
+    const remoteDocs = await meta.find({
+      $or: [
+        { _id: relPath },
+        { _id: { $regex: `^${escapeRegex(relPath)}/` } },
+      ],
+    }).toArray();
+    const remoteById = new Map<string, FileMetaDoc>();
+    for (const doc of remoteDocs) remoteById.set(doc._id, doc);
+
+    let changes = 0;
+
+    for (const [rel, file] of local) {
+      const existing = remoteById.get(rel);
+      if (
+        existing && existing.deletedAt === null && existing.hash === file.hash
+      ) continue;
+
+      const fileBytes = await Deno.readFile(`${cachePath}/${rel}`);
+      const newId = await uploadBytes(bucket, rel, fileBytes);
+      await meta.updateOne(
+        { _id: rel },
+        {
+          $set: {
+            hash: file.hash,
+            size: file.size,
+            gridfsFileId: newId,
+            updatedAt: new Date(),
+            deletedAt: null,
           },
-          { upsert: true },
-        );
+        },
+        { upsert: true },
+      );
+      if (existing?.gridfsFileId) {
+        await deleteSilently(bucket, existing.gridfsFileId);
+      }
+      changes++;
+    }
 
-        if (existing?.gridfsFileId) {
-          await deleteSilently(bucket, existing.gridfsFileId);
-        }
+    if (lastPulledAt !== null) {
+      const watermark = new Date(lastPulledAt);
+      for (const doc of remoteDocs) {
+        if (local.has(doc._id)) continue;
+        if (doc.deletedAt !== null) continue;
+        if (doc.updatedAt > watermark) continue;
+        await meta.updateOne(
+          { _id: doc._id },
+          { $set: { deletedAt: new Date(), updatedAt: new Date() } },
+        );
+        await deleteSilently(bucket, doc.gridfsFileId);
         changes++;
       }
+    }
 
+    return changes;
+  }
+
+  function escapeRegex(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  async function fullWalkPush(
+    meta: Collection<FileMetaDoc>,
+    bucket: GridFSBucket,
+    lastPulledAt: string | null,
+  ): Promise<number> {
+    const local = await walkLocal();
+    const remote = await loadMeta(meta);
+    let changes = 0;
+
+    for (const [relPath, file] of local) {
+      const existing = remote.get(relPath);
+      if (
+        existing &&
+        existing.deletedAt === null &&
+        existing.hash === file.hash
+      ) continue;
+
+      const absPath = `${cachePath}/${relPath}`;
+      let bytes: Uint8Array;
+      try {
+        bytes = await Deno.readFile(absPath);
+      } catch (err) {
+        if (err instanceof Deno.errors.NotFound) continue;
+        throw err;
+      }
+      const newId = await uploadBytes(bucket, relPath, bytes);
+
+      await meta.updateOne(
+        { _id: relPath },
+        {
+          $set: {
+            hash: file.hash,
+            size: file.size,
+            gridfsFileId: newId,
+            updatedAt: new Date(),
+            deletedAt: null,
+          },
+        },
+        { upsert: true },
+      );
+
+      if (existing?.gridfsFileId) {
+        await deleteSilently(bucket, existing.gridfsFileId);
+      }
+      changes++;
+    }
+
+    // Tombstone gate: only deletes files we KNOW we previously synced
+    // and are now missing locally. Without this, a fresh-cache host on a
+    // shared namespace would silently delete every other writer's data.
+    //
+    //   doc.updatedAt > lastPulledAt → another writer pushed after our
+    //                                  last pull; not ours to tombstone.
+    //   lastPulledAt === null        → cold start; we can't distinguish
+    //                                  "we deleted it" from "we never
+    //                                  had it." Skip the whole loop.
+    //
+    // Tradeoff: legitimately-deleted files during a bulk-invalidate
+    // window won't be tombstoned until a per-path push arrives or the
+    // post-#232 markDirty(relPath) signal flows through. Zombies in
+    // Mongo are recoverable; spurious tombstones are not.
+    if (lastPulledAt !== null) {
+      const watermark = new Date(lastPulledAt);
       for (const [relPath, doc] of remote) {
         if (local.has(relPath) || doc.deletedAt !== null) continue;
+        if (doc.updatedAt > watermark) continue;
         await meta.updateOne(
           { _id: relPath },
           { $set: { deletedAt: new Date(), updatedAt: new Date() } },
@@ -138,40 +268,93 @@ export function createSyncService(
         await deleteSilently(bucket, doc.gridfsFileId);
         changes++;
       }
+    }
 
+    return changes;
+  }
+
+  return {
+    async pushChanged(): Promise<number> {
+      const { meta, bucket } = await resources();
+      const state = await sidecar.read();
+
+      // Bulk path: full walk on cold start, on explicit bulk invalidate
+      // (markDirty without relPath), or on corrupt/missing sidecar (which
+      // readState already converts to bulkInvalidated=true).
+      if (state.bulkInvalidated) {
+        const changes = await fullWalkPush(meta, bucket, state.lastPulledAt);
+        await sidecar.clearDirty();
+        return changes;
+      }
+
+      // Per-path path: trust the contract that every cache write went
+      // through swamp-core's markDirty(relPath). Empty dirty set means
+      // nothing changed locally since the last successful push.
+      if (state.dirtyPaths.length === 0) return 0;
+
+      let changes = 0;
+      for (const relPath of state.dirtyPaths) {
+        changes += await pushOneRel(meta, bucket, relPath, state.lastPulledAt);
+      }
+      await sidecar.clearDirty();
       return changes;
     },
 
     async pullChanged(): Promise<number> {
       const { meta, bucket } = await resources();
-      const local = await walkLocal();
-      const remote = await loadMeta(meta);
-      let changes = 0;
+      const state = await sidecar.read();
 
-      for (const [relPath, doc] of remote) {
+      // Fast-path: nothing in remote with updatedAt > lastPulledAt → 0.
+      if (state.lastPulledAt !== null) {
+        const since = new Date(state.lastPulledAt);
+        const probe = await meta.findOne(
+          { updatedAt: { $gt: since } },
+          { projection: { _id: 1 } },
+        );
+        if (probe === null) return 0;
+      }
+
+      // Slow path: download everything that has moved since lastPulledAt
+      // (or everything, on first pull with no sidecar history).
+      const filter = state.lastPulledAt !== null
+        ? { updatedAt: { $gt: new Date(state.lastPulledAt) } }
+        : {};
+      let changes = 0;
+      let maxUpdatedAtMs = state.lastPulledAt !== null
+        ? new Date(state.lastPulledAt).getTime()
+        : 0;
+
+      for await (const doc of meta.find(filter)) {
+        const docMs = doc.updatedAt.getTime();
+        if (docMs > maxUpdatedAtMs) maxUpdatedAtMs = docMs;
+
         if (doc.deletedAt !== null) {
-          if (local.has(relPath)) {
-            await removeSilently(`${cachePath}/${relPath}`);
+          if (await removeSilentlyExisting(`${cachePath}/${doc._id}`)) {
             changes++;
           }
           continue;
         }
-        const localEntry = local.get(relPath);
-        if (localEntry && localEntry.hash === doc.hash) continue;
+
+        const localBytes = await readFileOrNull(`${cachePath}/${doc._id}`);
+        if (localBytes !== null) {
+          const localHash = await sha256Hex(localBytes);
+          if (localHash === doc.hash) continue;
+        }
 
         const bytes = await downloadBytes(bucket, doc.gridfsFileId);
-        await writeFileAtomic(`${cachePath}/${relPath}`, bytes);
+        await writeFileAtomic(`${cachePath}/${doc._id}`, bytes);
         changes++;
       }
 
+      const watermark = maxUpdatedAtMs > 0
+        ? new Date(maxUpdatedAtMs).toISOString()
+        : new Date().toISOString();
+      await sidecar.setLastPulledAt(watermark);
       return changes;
     },
 
-    markDirty(): Promise<void> {
-      // No fast-path watermark to invalidate — pushChanged always walks
-      // the cache. If a future optimization adds a clean/dirty sidecar,
-      // flip it to dirty here.
-      return Promise.resolve();
+    markDirty(options?: DatastoreSyncOptions): Promise<void> {
+      return sidecar.recordDirty(options?.relPath).then(() => undefined);
     },
   };
 }
@@ -268,11 +451,22 @@ async function deleteSilently(
   }
 }
 
-async function removeSilently(path: string): Promise<void> {
+async function removeSilentlyExisting(path: string): Promise<boolean> {
   try {
     await Deno.remove(path);
+    return true;
   } catch (err) {
-    if (!(err instanceof Deno.errors.NotFound)) throw err;
+    if (err instanceof Deno.errors.NotFound) return false;
+    throw err;
+  }
+}
+
+async function readFileOrNull(path: string): Promise<Uint8Array | null> {
+  try {
+    return await Deno.readFile(path);
+  } catch (err) {
+    if (err instanceof Deno.errors.NotFound) return null;
+    throw err;
   }
 }
 
@@ -287,3 +481,6 @@ async function writeFileAtomic(
   await Deno.writeFile(tmp, bytes);
   await Deno.rename(tmp, absPath);
 }
+
+// Re-exported for tests.
+export type { SidecarState };
