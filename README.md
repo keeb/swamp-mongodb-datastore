@@ -61,16 +61,24 @@ Swamp picks it up on the next invocation.
 | `defaultLockTtlMs` | number | no       | `30000`          | Default lock TTL. Must exceed your longest critical section.                |
 
 Collections are prefixed `t_<tenantId>_r_<namespace>_*` — `_locks` for lock
-docs, `_fs_meta` for sync metadata, plus a GridFS bucket `_fs` .
+docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
 
 ## What it does
 
 - **Distributed lock.** `findOneAndUpdate` on a lock doc, TTL + heartbeat
   refresh, nonce fenced on `release` and `forceRelease`. Global + per-model
   keys.
-- **GridFS byte sync.** Pushes the datastore-tier cache tree
-  (`.swamp/<cache>/{data,outputs,workflow-runs,...}`) to MongoDB on change,
-  pulls on other hosts. Multiple machines can operate against one swamp repo.
+- **Manifest + content-addressed blob sync.** The datastore-tier cache tree
+  (`.swamp/<cache>/{data,outputs,workflow-runs,...}`) is split across two
+  collections: `_paths` holds one doc per file
+  (`{_id: relPath, hash, size,
+  updatedAt, deletedAt}`) and `_blobs` holds
+  bytes keyed by their sha256. Pull = cursor over `_paths` since the last
+  watermark + bulk `$in` over `_blobs` for the unique hashes the host doesn't
+  already have. Push = hash locally, upsert any blob that's missing (idempotent
+  on the hash `_id`), upsert path docs in bulk. Identical bytes pushed by N
+  agents collapse to one blob server-side; renames are free; the cursor itself
+  is the wire transport (no per-file roundtrips).
 - **Health verifier.** Rejects non-replica-set clusters and reports
   primary/secondary state, latency, and namespace.
 

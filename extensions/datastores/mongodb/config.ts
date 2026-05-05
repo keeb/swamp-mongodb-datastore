@@ -32,12 +32,12 @@ export function lockCollectionName(cfg: MongoDatastoreConfig): string {
   return `${collectionPrefix(cfg)}_locks`;
 }
 
-export function gridfsBucketName(cfg: MongoDatastoreConfig): string {
-  return `${collectionPrefix(cfg)}_fs`;
+export function pathsCollectionName(cfg: MongoDatastoreConfig): string {
+  return `${collectionPrefix(cfg)}_paths`;
 }
 
-export function fsMetaCollectionName(cfg: MongoDatastoreConfig): string {
-  return `${collectionPrefix(cfg)}_fs_meta`;
+export function blobsCollectionName(cfg: MongoDatastoreConfig): string {
+  return `${collectionPrefix(cfg)}_blobs`;
 }
 
 const ENV_LINE = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/;

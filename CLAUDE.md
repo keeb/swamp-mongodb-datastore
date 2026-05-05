@@ -49,7 +49,7 @@ you're targeting.
   - `client.ts` — `MongoClient` factory, cached per `repoDir`
   - `config.ts` — Zod `ConfigSchema`, collection naming, `.env` loader
   - `lock.ts` — TTL lock with heartbeat + nonce fencing
-  - `sync.ts` — GridFS byte sync of the datastore tier
+  - `sync.ts` — manifest + content-addressed blob sync of the datastore tier
   - `verifier.ts` — replica-set health check
 
   Root `manifest.yaml` is the publishable package manifest.
@@ -66,12 +66,19 @@ you're targeting.
    expired locks. A nonce protects `release` and `forceRelease` from acting on a
    lock that was already reaped.
 2. **Sync service.** Swamp core writes a local cache tree under the datastore
-   tier. `sync.ts` mirrors those bytes to GridFS so other hosts can pull them
-   back.
+   tier. `sync.ts` mirrors that tree to two collections: `_paths` (one manifest
+   doc per file: `{_id: relPath, hash, size, updatedAt, deletedAt}`) and
+   `_blobs` (content-addressed bytes keyed by sha256). Pulls walk the `_paths`
+   cursor since the last watermark and bulk-`$in` over `_blobs` for only the
+   hashes the host doesn't already have. The cursor itself is the wire transport
+   — no per-file roundtrips.
 3. **Actor metadata.** No interface hook for "who." `$USER@$HOSTNAME` (plus pid)
    gets stamped onto every lock doc from the environment.
-4. **Bytes vs. metadata split.** Everything lives in Mongo — metadata in normal
-   collections, bytes in GridFS.
+4. **Bytes vs. metadata split.** Manifest in `_paths`, bytes in `_blobs`, keyed
+   by content hash. Identical bytes pushed by N agents collapse to a single blob
+   server-side. Blobs ride inline as `Binary` (under MongoDB's 16MB BSON limit).
+   No GridFS — the per-file `find`/chunk-read overhead it imposes is what made
+   the previous protocol RTT-bound on tiny-file workloads.
 
 ## Verification
 

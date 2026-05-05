@@ -1,19 +1,18 @@
-import { type Collection, GridFSBucket, ObjectId } from "npm:mongodb@6.17.0";
+import {
+  type AnyBulkWriteOperation,
+  Binary,
+  type Collection,
+} from "npm:mongodb@6.17.0";
 import type { ClientHandle } from "./client.ts";
 import {
-  fsMetaCollectionName,
-  gridfsBucketName,
+  blobsCollectionName,
   type MongoDatastoreConfig,
+  pathsCollectionName,
 } from "./config.ts";
 import { Sidecar, type SidecarState } from "./sidecar.ts";
 
 export interface DatastoreSyncOptions {
   signal?: AbortSignal;
-  // Cache-relative path (forward-slash) of the file about to be written or
-  // removed. Set by swamp-core on per-path markDirty calls; undefined for
-  // bulk mutations (rename, collectGarbage). No defined meaning on
-  // pullChanged / pushChanged — present on the shared options bag for
-  // source compatibility (see swamp-club#232 rule 7).
   relPath?: string;
 }
 
@@ -23,10 +22,6 @@ export interface DatastoreSyncService {
   markDirty(options?: DatastoreSyncOptions): Promise<void>;
 }
 
-// Mirrors swamp core's DEFAULT_DATASTORE_SUBDIRS — the subdirs under the
-// cache path that belong to the datastore tier. datastore-bundles is
-// intentionally absent: the loader that reads it runs before the provider
-// exists, so those bytes must stay local.
 const DATASTORE_SUBDIRS = [
   "definitions-evaluated",
   "workflows-evaluated",
@@ -44,19 +39,29 @@ const DATASTORE_SUBDIRS = [
   "files",
 ] as const;
 
-interface FileMetaDoc {
+interface PathDoc {
   _id: string;
   hash: string;
   size: number;
-  gridfsFileId: ObjectId;
   updatedAt: Date;
   deletedAt: Date | null;
 }
 
+interface BlobDoc {
+  _id: string;
+  size: number;
+  data: Binary;
+}
+
 interface LocalFile {
+  relPath: string;
   hash: string;
   size: number;
+  bytes: Uint8Array;
 }
+
+const PUSH_BULK = 500;
+const BLOB_QUERY_BATCH = 5000;
 
 export function createSyncService(
   cfg: MongoDatastoreConfig,
@@ -68,55 +73,242 @@ export function createSyncService(
   let updatedAtIndexEnsured = false;
 
   async function resources(): Promise<{
-    meta: Collection<FileMetaDoc>;
-    bucket: GridFSBucket;
+    paths: Collection<PathDoc>;
+    blobs: Collection<BlobDoc>;
   }> {
     const { client } = await getClient(repoDir);
     const db = client.db(cfg.database);
-    const meta = db.collection<FileMetaDoc>(fsMetaCollectionName(cfg));
-    const bucket = new GridFSBucket(db, { bucketName: gridfsBucketName(cfg) });
+    const paths = db.collection<PathDoc>(pathsCollectionName(cfg));
+    const blobs = db.collection<BlobDoc>(blobsCollectionName(cfg));
     if (!updatedAtIndexEnsured) {
-      await meta.createIndex({ updatedAt: 1 }).catch(() => undefined);
+      await paths.createIndex({ updatedAt: 1 }).catch(() => undefined);
       updatedAtIndexEnsured = true;
     }
-    return { meta, bucket };
+    return { paths, blobs };
   }
 
-  async function loadMeta(
-    meta: Collection<FileMetaDoc>,
-  ): Promise<Map<string, FileMetaDoc>> {
-    const out = new Map<string, FileMetaDoc>();
-    for await (const doc of meta.find({})) out.set(doc._id, doc);
-    return out;
+  function poolConcurrency(): number {
+    return parseInt(
+      Deno.env.get("MONGO_DATASTORE_PULL_CONCURRENCY") ?? "32",
+      10,
+    );
   }
 
-  async function walkLocal(): Promise<Map<string, LocalFile>> {
-    const out = new Map<string, LocalFile>();
-    for (const sub of DATASTORE_SUBDIRS) {
-      const root = `${cachePath}/${sub}`;
-      await walkInto(root, sub, out);
+  async function pull(): Promise<number> {
+    const { paths, blobs } = await resources();
+    const state = await sidecar.read();
+
+    if (state.lastPulledAt !== null) {
+      const since = new Date(state.lastPulledAt);
+      const probe = await paths.findOne(
+        { updatedAt: { $gt: since } },
+        { projection: { _id: 1 } },
+      );
+      if (probe === null) return 0;
     }
-    return out;
+
+    const filter = state.lastPulledAt !== null
+      ? { updatedAt: { $gt: new Date(state.lastPulledAt) } }
+      : {};
+    const coldStart = state.lastPulledAt === null;
+
+    const pathDocs: PathDoc[] = [];
+    let maxUpdatedAtMs = state.lastPulledAt !== null
+      ? new Date(state.lastPulledAt).getTime()
+      : 0;
+    for await (const doc of paths.find(filter)) {
+      pathDocs.push(doc);
+      const ms = doc.updatedAt.getTime();
+      if (ms > maxUpdatedAtMs) maxUpdatedAtMs = ms;
+    }
+
+    const concurrency = poolConcurrency();
+    let changes = 0;
+
+    const deletes = pathDocs.filter((d) => d.deletedAt !== null);
+    await runPool(deletes, concurrency, async (doc) => {
+      if (await removeSilentlyExisting(`${cachePath}/${doc._id}`)) changes++;
+    });
+
+    const needs = pathDocs.filter((d) => d.deletedAt === null);
+    const pathsByHash = new Map<string, PathDoc[]>();
+    if (coldStart) {
+      for (const doc of needs) addToBucket(pathsByHash, doc.hash, doc);
+    } else {
+      await runPool(needs, concurrency, async (doc) => {
+        const local = await readFileOrNull(`${cachePath}/${doc._id}`);
+        if (local !== null && (await sha256Hex(local)) === doc.hash) return;
+        addToBucket(pathsByHash, doc.hash, doc);
+      });
+    }
+
+    const hashesNeeded = [...pathsByHash.keys()];
+    for (let i = 0; i < hashesNeeded.length; i += BLOB_QUERY_BATCH) {
+      const hashBatch = hashesNeeded.slice(i, i + BLOB_QUERY_BATCH);
+      const writeJobs: Array<{ relPath: string; bytes: Uint8Array }> = [];
+      for await (const blob of blobs.find({ _id: { $in: hashBatch } })) {
+        const bytes = blob.data.buffer;
+        const dependents = pathsByHash.get(blob._id) ?? [];
+        for (const doc of dependents) {
+          writeJobs.push({ relPath: doc._id, bytes });
+        }
+      }
+      await runPool(writeJobs, concurrency, async ({ relPath, bytes }) => {
+        await writeFileAtomic(`${cachePath}/${relPath}`, bytes);
+        changes++;
+      });
+    }
+
+    const watermark = maxUpdatedAtMs > 0
+      ? new Date(maxUpdatedAtMs).toISOString()
+      : new Date().toISOString();
+    await sidecar.setLastPulledAt(watermark);
+    return changes;
   }
 
-  // Push a single relPath signal. relPath can be:
-  //   - a file (yaml repo writes, finalizeVersion) — push exactly that one
-  //   - a directory subtree (data-name dir from save/append/allocateVersion,
-  //     version dir from delete-version) — push every file under it that
-  //     differs from remote; safe-tombstone files remote has under the
-  //     prefix that local doesn't, subject to the lastPulledAt watermark
-  //     check (same gate fullWalkPush uses to avoid clobbering another
-  //     writer's data).
-  //   - absent — tombstone anything remote has under the prefix (with the
-  //     same watermark gate).
+  async function fullWalkPush(
+    paths: Collection<PathDoc>,
+    blobs: Collection<BlobDoc>,
+    lastPulledAt: string | null,
+  ): Promise<number> {
+    const locals: LocalFile[] = [];
+    for (const sub of DATASTORE_SUBDIRS) {
+      await walkInto(`${cachePath}/${sub}`, sub, locals);
+    }
+
+    const localByHash = new Map<string, Uint8Array>();
+    for (const f of locals) {
+      if (!localByHash.has(f.hash)) localByHash.set(f.hash, f.bytes);
+    }
+    const remotePaths = new Map<string, PathDoc>();
+    for await (const doc of paths.find({})) remotePaths.set(doc._id, doc);
+
+    const localHashes = [...localByHash.keys()];
+    const remoteBlobHashes = new Set<string>();
+    for (let i = 0; i < localHashes.length; i += BLOB_QUERY_BATCH) {
+      const batch = localHashes.slice(i, i + BLOB_QUERY_BATCH);
+      for await (
+        const b of blobs.find(
+          { _id: { $in: batch } },
+          { projection: { _id: 1 } },
+        )
+      ) {
+        remoteBlobHashes.add(b._id);
+      }
+    }
+    const missingHashes = localHashes.filter((h) => !remoteBlobHashes.has(h));
+    let blobsPushed = 0;
+    if (missingHashes.length > 0) {
+      let i = 0;
+      while (i < missingHashes.length) {
+        const ops: { insertOne: { document: BlobDoc } }[] = [];
+        let batchBytes = 0;
+        while (
+          i < missingHashes.length &&
+          ops.length < PUSH_BULK &&
+          batchBytes < 14 * 1024 * 1024
+        ) {
+          const h = missingHashes[i++];
+          const bytes = localByHash.get(h)!;
+          batchBytes += bytes.byteLength + 64;
+          ops.push({
+            insertOne: {
+              document: {
+                _id: h,
+                size: bytes.byteLength,
+                data: new Binary(bytes),
+              },
+            },
+          });
+        }
+        try {
+          const res = await blobs.bulkWrite(ops, { ordered: false });
+          blobsPushed += res.insertedCount;
+        } catch (err) {
+          if (
+            !(err instanceof Error) ||
+            !("code" in err) ||
+            (err as { code?: number }).code !== 11000
+          ) {
+            const wErr = err as {
+              writeErrors?: Array<{ code: number }>;
+              insertedCount?: number;
+            };
+            const allDup = (wErr.writeErrors ?? []).every((e) =>
+              e.code === 11000
+            );
+            if (!allDup) throw err;
+            blobsPushed += wErr.insertedCount ?? 0;
+          }
+        }
+      }
+    }
+    let pathsPushed = 0;
+    let pathOps: AnyBulkWriteOperation<PathDoc>[] = [];
+    const flushPathOps = async () => {
+      if (pathOps.length === 0) return;
+      const res = await paths.bulkWrite(pathOps, { ordered: false });
+      pathsPushed += (res.upsertedCount ?? 0) + (res.modifiedCount ?? 0);
+      pathOps = [];
+    };
+    const now = new Date();
+    for (const f of locals) {
+      const existing = remotePaths.get(f.relPath);
+      if (
+        existing &&
+        existing.deletedAt === null &&
+        existing.hash === f.hash
+      ) continue;
+      pathOps.push({
+        updateOne: {
+          filter: { _id: f.relPath },
+          update: {
+            $set: {
+              hash: f.hash,
+              size: f.size,
+              updatedAt: now,
+              deletedAt: null,
+            },
+          },
+          upsert: true,
+        },
+      });
+      if (pathOps.length >= PUSH_BULK) await flushPathOps();
+    }
+    await flushPathOps();
+
+    if (lastPulledAt !== null) {
+      const watermark = new Date(lastPulledAt);
+      const localPaths = new Set(locals.map((f) => f.relPath));
+      const tombstoneOps: AnyBulkWriteOperation<PathDoc>[] = [];
+      for (const [relPath, doc] of remotePaths) {
+        if (localPaths.has(relPath) || doc.deletedAt !== null) continue;
+        if (doc.updatedAt > watermark) continue;
+        tombstoneOps.push({
+          updateOne: {
+            filter: { _id: relPath },
+            update: { $set: { deletedAt: now, updatedAt: now } },
+          },
+        });
+        pathsPushed++;
+      }
+      for (let i = 0; i < tombstoneOps.length; i += PUSH_BULK) {
+        await paths.bulkWrite(
+          tombstoneOps.slice(i, i + PUSH_BULK),
+          { ordered: false },
+        );
+      }
+    }
+    return pathsPushed + blobsPushed;
+  }
+
   async function pushOneRel(
-    meta: Collection<FileMetaDoc>,
-    bucket: GridFSBucket,
+    paths: Collection<PathDoc>,
+    blobs: Collection<BlobDoc>,
     relPath: string,
     lastPulledAt: string | null,
   ): Promise<number> {
     const absPath = `${cachePath}/${relPath}`;
-
     let stat: Deno.FileInfo | null = null;
     try {
       stat = await Deno.stat(absPath);
@@ -124,149 +316,123 @@ export function createSyncService(
       if (!(err instanceof Deno.errors.NotFound)) throw err;
     }
 
-    const local = new Map<string, LocalFile>();
+    const local: LocalFile[] = [];
     if (stat?.isFile) {
       const bytes = await Deno.readFile(absPath);
-      local.set(relPath, {
+      local.push({
+        relPath,
         hash: await sha256Hex(bytes),
         size: bytes.byteLength,
+        bytes,
       });
     } else if (stat?.isDirectory) {
       await walkInto(absPath, relPath, local);
     }
 
-    const remoteDocs = await meta.find({
+    const remoteDocs = await paths.find({
       $or: [
         { _id: relPath },
         { _id: { $regex: `^${escapeRegex(relPath)}/` } },
       ],
     }).toArray();
-    const remoteById = new Map<string, FileMetaDoc>();
-    for (const doc of remoteDocs) remoteById.set(doc._id, doc);
+    const remoteByPath = new Map<string, PathDoc>();
+    for (const d of remoteDocs) remoteByPath.set(d._id, d);
 
+    const localByHash = new Map<string, Uint8Array>();
+    for (const f of local) {
+      if (!localByHash.has(f.hash)) localByHash.set(f.hash, f.bytes);
+    }
     let changes = 0;
 
-    for (const [rel, file] of local) {
-      const existing = remoteById.get(rel);
-      if (
-        existing && existing.deletedAt === null && existing.hash === file.hash
-      ) continue;
-
-      const fileBytes = await Deno.readFile(`${cachePath}/${rel}`);
-      const newId = await uploadBytes(bucket, rel, fileBytes);
-      await meta.updateOne(
-        { _id: rel },
-        {
-          $set: {
-            hash: file.hash,
-            size: file.size,
-            gridfsFileId: newId,
-            updatedAt: new Date(),
-            deletedAt: null,
-          },
+    const localHashes = [...localByHash.keys()];
+    const remoteBlobHashes = new Set<string>();
+    if (localHashes.length > 0) {
+      for await (
+        const b of blobs.find(
+          { _id: { $in: localHashes } },
+          { projection: { _id: 1 } },
+        )
+      ) {
+        remoteBlobHashes.add(b._id);
+      }
+    }
+    const missing = localHashes.filter((h) => !remoteBlobHashes.has(h));
+    if (missing.length > 0) {
+      const ops = missing.map((h) => ({
+        insertOne: {
+          document: {
+            _id: h,
+            size: localByHash.get(h)!.byteLength,
+            data: new Binary(localByHash.get(h)!),
+          } as BlobDoc,
         },
-        { upsert: true },
-      );
-      if (existing?.gridfsFileId) {
-        await deleteSilently(bucket, existing.gridfsFileId);
-      }
-      changes++;
-    }
-
-    if (lastPulledAt !== null) {
-      const watermark = new Date(lastPulledAt);
-      for (const doc of remoteDocs) {
-        if (local.has(doc._id)) continue;
-        if (doc.deletedAt !== null) continue;
-        if (doc.updatedAt > watermark) continue;
-        await meta.updateOne(
-          { _id: doc._id },
-          { $set: { deletedAt: new Date(), updatedAt: new Date() } },
-        );
-        await deleteSilently(bucket, doc.gridfsFileId);
-        changes++;
+      }));
+      try {
+        const res = await blobs.bulkWrite(ops, { ordered: false });
+        changes += res.insertedCount ?? 0;
+      } catch (err) {
+        const wErr = err as {
+          writeErrors?: Array<{ code: number }>;
+          insertedCount?: number;
+        };
+        const allDup = (wErr.writeErrors ?? []).every((e) => e.code === 11000);
+        if (!allDup) throw err;
+        changes += wErr.insertedCount ?? 0;
       }
     }
 
-    return changes;
-  }
-
-  function escapeRegex(s: string): string {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
-  async function fullWalkPush(
-    meta: Collection<FileMetaDoc>,
-    bucket: GridFSBucket,
-    lastPulledAt: string | null,
-  ): Promise<number> {
-    const local = await walkLocal();
-    const remote = await loadMeta(meta);
-    let changes = 0;
-
-    for (const [relPath, file] of local) {
-      const existing = remote.get(relPath);
+    const now = new Date();
+    const pathOps: AnyBulkWriteOperation<PathDoc>[] = [];
+    for (const f of local) {
+      const existing = remoteByPath.get(f.relPath);
       if (
         existing &&
         existing.deletedAt === null &&
-        existing.hash === file.hash
+        existing.hash === f.hash
       ) continue;
-
-      const absPath = `${cachePath}/${relPath}`;
-      let bytes: Uint8Array;
-      try {
-        bytes = await Deno.readFile(absPath);
-      } catch (err) {
-        if (err instanceof Deno.errors.NotFound) continue;
-        throw err;
-      }
-      const newId = await uploadBytes(bucket, relPath, bytes);
-
-      await meta.updateOne(
-        { _id: relPath },
-        {
-          $set: {
-            hash: file.hash,
-            size: file.size,
-            gridfsFileId: newId,
-            updatedAt: new Date(),
-            deletedAt: null,
+      pathOps.push({
+        updateOne: {
+          filter: { _id: f.relPath },
+          update: {
+            $set: {
+              hash: f.hash,
+              size: f.size,
+              updatedAt: now,
+              deletedAt: null,
+            },
           },
+          upsert: true,
         },
-        { upsert: true },
-      );
-
-      if (existing?.gridfsFileId) {
-        await deleteSilently(bucket, existing.gridfsFileId);
-      }
+      });
       changes++;
     }
+    for (let i = 0; i < pathOps.length; i += PUSH_BULK) {
+      await paths.bulkWrite(
+        pathOps.slice(i, i + PUSH_BULK),
+        { ordered: false },
+      );
+    }
 
-    // Tombstone gate: only deletes files we KNOW we previously synced
-    // and are now missing locally. Without this, a fresh-cache host on a
-    // shared namespace would silently delete every other writer's data.
-    //
-    //   doc.updatedAt > lastPulledAt → another writer pushed after our
-    //                                  last pull; not ours to tombstone.
-    //   lastPulledAt === null        → cold start; we can't distinguish
-    //                                  "we deleted it" from "we never
-    //                                  had it." Skip the whole loop.
-    //
-    // Tradeoff: legitimately-deleted files during a bulk-invalidate
-    // window won't be tombstoned until a per-path push arrives or the
-    // post-#232 markDirty(relPath) signal flows through. Zombies in
-    // Mongo are recoverable; spurious tombstones are not.
     if (lastPulledAt !== null) {
       const watermark = new Date(lastPulledAt);
-      for (const [relPath, doc] of remote) {
-        if (local.has(relPath) || doc.deletedAt !== null) continue;
+      const localPaths = new Set(local.map((f) => f.relPath));
+      const tombstoneOps: AnyBulkWriteOperation<PathDoc>[] = [];
+      for (const doc of remoteDocs) {
+        if (localPaths.has(doc._id) || doc.deletedAt !== null) continue;
         if (doc.updatedAt > watermark) continue;
-        await meta.updateOne(
-          { _id: relPath },
-          { $set: { deletedAt: new Date(), updatedAt: new Date() } },
-        );
-        await deleteSilently(bucket, doc.gridfsFileId);
+        tombstoneOps.push({
+          updateOne: {
+            filter: { _id: doc._id },
+            update: { $set: { deletedAt: now, updatedAt: now } },
+          },
+        });
         changes++;
+      }
+      for (let i = 0; i < tombstoneOps.length; i += PUSH_BULK) {
+        await paths.bulkWrite(
+          tombstoneOps.slice(i, i + PUSH_BULK),
+          { ordered: false },
+        );
       }
     }
 
@@ -275,82 +441,26 @@ export function createSyncService(
 
   return {
     async pushChanged(): Promise<number> {
-      const { meta, bucket } = await resources();
+      const { paths, blobs } = await resources();
       const state = await sidecar.read();
 
-      // Bulk path: full walk on cold start, on explicit bulk invalidate
-      // (markDirty without relPath), or on corrupt/missing sidecar (which
-      // readState already converts to bulkInvalidated=true).
       if (state.bulkInvalidated) {
-        const changes = await fullWalkPush(meta, bucket, state.lastPulledAt);
+        const changes = await fullWalkPush(paths, blobs, state.lastPulledAt);
         await sidecar.clearDirty();
         return changes;
       }
 
-      // Per-path path: trust the contract that every cache write went
-      // through swamp-core's markDirty(relPath). Empty dirty set means
-      // nothing changed locally since the last successful push.
       if (state.dirtyPaths.length === 0) return 0;
-
       let changes = 0;
       for (const relPath of state.dirtyPaths) {
-        changes += await pushOneRel(meta, bucket, relPath, state.lastPulledAt);
+        changes += await pushOneRel(paths, blobs, relPath, state.lastPulledAt);
       }
       await sidecar.clearDirty();
       return changes;
     },
 
-    async pullChanged(): Promise<number> {
-      const { meta, bucket } = await resources();
-      const state = await sidecar.read();
-
-      // Fast-path: nothing in remote with updatedAt > lastPulledAt → 0.
-      if (state.lastPulledAt !== null) {
-        const since = new Date(state.lastPulledAt);
-        const probe = await meta.findOne(
-          { updatedAt: { $gt: since } },
-          { projection: { _id: 1 } },
-        );
-        if (probe === null) return 0;
-      }
-
-      // Slow path: download everything that has moved since lastPulledAt
-      // (or everything, on first pull with no sidecar history).
-      const filter = state.lastPulledAt !== null
-        ? { updatedAt: { $gt: new Date(state.lastPulledAt) } }
-        : {};
-      let changes = 0;
-      let maxUpdatedAtMs = state.lastPulledAt !== null
-        ? new Date(state.lastPulledAt).getTime()
-        : 0;
-
-      for await (const doc of meta.find(filter)) {
-        const docMs = doc.updatedAt.getTime();
-        if (docMs > maxUpdatedAtMs) maxUpdatedAtMs = docMs;
-
-        if (doc.deletedAt !== null) {
-          if (await removeSilentlyExisting(`${cachePath}/${doc._id}`)) {
-            changes++;
-          }
-          continue;
-        }
-
-        const localBytes = await readFileOrNull(`${cachePath}/${doc._id}`);
-        if (localBytes !== null) {
-          const localHash = await sha256Hex(localBytes);
-          if (localHash === doc.hash) continue;
-        }
-
-        const bytes = await downloadBytes(bucket, doc.gridfsFileId);
-        await writeFileAtomic(`${cachePath}/${doc._id}`, bytes);
-        changes++;
-      }
-
-      const watermark = maxUpdatedAtMs > 0
-        ? new Date(maxUpdatedAtMs).toISOString()
-        : new Date().toISOString();
-      await sidecar.setLastPulledAt(watermark);
-      return changes;
+    pullChanged(): Promise<number> {
+      return pull();
     },
 
     markDirty(options?: DatastoreSyncOptions): Promise<void> {
@@ -359,10 +469,34 @@ export function createSyncService(
   };
 }
 
+function addToBucket<K, V>(map: Map<K, V[]>, key: K, value: V): void {
+  const list = map.get(key);
+  if (list) list.push(value);
+  else map.set(key, [value]);
+}
+
+async function runPool<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  let idx = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+      while (true) {
+        const i = idx++;
+        if (i >= items.length) return;
+        await worker(items[i]);
+      }
+    }),
+  );
+}
+
 async function walkInto(
   root: string,
   relRoot: string,
-  out: Map<string, LocalFile>,
+  out: LocalFile[],
 ): Promise<void> {
   try {
     for await (const entry of Deno.readDir(root)) {
@@ -381,8 +515,12 @@ async function walkInto(
         if (err instanceof Deno.errors.NotFound) continue;
         throw err;
       }
-      const hash = await sha256Hex(bytes);
-      out.set(childRel, { hash, size: bytes.byteLength });
+      out.push({
+        relPath: childRel,
+        hash: await sha256Hex(bytes),
+        size: bytes.byteLength,
+        bytes,
+      });
     }
   } catch (err) {
     if (err instanceof Deno.errors.NotFound) return;
@@ -400,55 +538,6 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
     hex += view[i].toString(16).padStart(2, "0");
   }
   return hex;
-}
-
-function uploadBytes(
-  bucket: GridFSBucket,
-  filename: string,
-  bytes: Uint8Array,
-): Promise<ObjectId> {
-  return new Promise((resolve, reject) => {
-    const stream = bucket.openUploadStream(filename);
-    stream.once("error", reject);
-    stream.once("finish", () => resolve(stream.id as ObjectId));
-    stream.end(bytes);
-  });
-}
-
-function downloadBytes(
-  bucket: GridFSBucket,
-  id: ObjectId,
-): Promise<Uint8Array> {
-  return new Promise((resolve, reject) => {
-    const stream = bucket.openDownloadStream(id);
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    stream.on("data", (chunk: Uint8Array) => {
-      chunks.push(chunk);
-      total += chunk.byteLength;
-    });
-    stream.once("error", reject);
-    stream.once("end", () => {
-      const out = new Uint8Array(total);
-      let offset = 0;
-      for (const c of chunks) {
-        out.set(c, offset);
-        offset += c.byteLength;
-      }
-      resolve(out);
-    });
-  });
-}
-
-async function deleteSilently(
-  bucket: GridFSBucket,
-  id: ObjectId,
-): Promise<void> {
-  try {
-    await bucket.delete(id);
-  } catch {
-    // Already gone — benign. Any other error would surface on next op.
-  }
 }
 
 async function removeSilentlyExisting(path: string): Promise<boolean> {
@@ -482,5 +571,8 @@ async function writeFileAtomic(
   await Deno.rename(tmp, absPath);
 }
 
-// Re-exported for tests.
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export type { SidecarState };
