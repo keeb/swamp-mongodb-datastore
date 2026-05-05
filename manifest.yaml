@@ -1,13 +1,13 @@
 manifestVersion: 1
 name: "@keeb/mongodb-datastore"
-version: "2026.05.04.1"
-description: "MongoDB-backed swamp datastore — distributed locks with TTL, heartbeat, and nonce fencing, plus GridFS-backed byte sync of the datastore tier between a local cache and MongoDB. Scoped by tenant + repo namespace. Requires MongoDB 4.0+ as a replica set."
+version: "2026.05.05.1"
+description: "MongoDB-backed swamp datastore — distributed locks with TTL, heartbeat, and nonce fencing, plus a manifest+content-addressed-blob sync protocol that streams the datastore tier as inline-bytes cursor batches. Scoped by tenant + repo namespace. Requires MongoDB 4.0+ as a replica set."
 repository: https://github.com/keeb/swamp-mongodb-datastore
 labels:
   - mongodb
   - datastore
   - distributed-lock
-  - gridfs
+  - content-addressed
   - replica-set
 platforms: []
 additionalFiles:
