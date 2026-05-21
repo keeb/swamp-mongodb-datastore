@@ -47,10 +47,20 @@ interface PathDoc {
   deletedAt: Date | null;
 }
 
+// Blob storage layout:
+//   * Inline blob (size <= BLOB_INLINE_MAX):
+//       { _id: <sha256>, size, data: <Binary> }
+//   * Chunked blob (size > BLOB_INLINE_MAX):
+//       Header doc:  { _id: <sha256>, size, chunkCount }            (no data)
+//       Chunk docs:  { _id: "<sha256>:<i>", size, data: <Binary> }   (i = 0..N-1)
+// `data` and `chunkCount` are mutually exclusive: a doc is either inline,
+// header, or chunk. Chunk ids use `:` which is not a sha256 hex character,
+// so chunk ids never collide with hash-only ids.
 interface BlobDoc {
   _id: string;
   size: number;
-  data: Binary;
+  data?: Binary;
+  chunkCount?: number;
 }
 
 interface LocalFile {
@@ -60,8 +70,32 @@ interface LocalFile {
   bytes: Uint8Array;
 }
 
+// Same shape as LocalFile minus bytes — used by fullWalkPush so we can walk
+// 100k+ files without buffering all of their contents in RAM.
+interface LocalMeta {
+  relPath: string;
+  hash: string;
+  size: number;
+}
+
+interface RemotePathSlim {
+  hash: string;
+  deletedAt: Date | null;
+  updatedAt: Date;
+}
+
 const PUSH_BULK = 500;
 const BLOB_QUERY_BATCH = 5000;
+// BSON doc cap is 16 MiB. Reserve ~1 MiB headroom for `_id`, `size`,
+// `chunkCount`, field-name overhead, and Binary subtype byte.
+const BLOB_INLINE_MAX = 15 * 1024 * 1024;
+// Each chunk doc is roughly this size; the last chunk is smaller.
+const BLOB_CHUNK_BYTES = 8 * 1024 * 1024;
+// Per-bulkWrite payload bound for inline blobs (stays under wire protocol cap).
+const BULK_INLINE_BYTES = 14 * 1024 * 1024;
+// MongoDB error codes we tolerate per-op without aborting the batch.
+const ERR_DUP_KEY = 11000;
+const ERR_DOC_TOO_LARGE = 10334;
 
 export function createSyncService(
   cfg: MongoDatastoreConfig,
@@ -146,9 +180,21 @@ export function createSyncService(
     for (let i = 0; i < hashesNeeded.length; i += BLOB_QUERY_BATCH) {
       const hashBatch = hashesNeeded.slice(i, i + BLOB_QUERY_BATCH);
       const writeJobs: Array<{ relPath: string; bytes: Uint8Array }> = [];
+      const chunkedHeaders: BlobDoc[] = [];
       for await (const blob of blobs.find({ _id: { $in: hashBatch } })) {
-        const bytes = blob.data.buffer;
-        const dependents = pathsByHash.get(blob._id) ?? [];
+        if (blob.data) {
+          const bytes = blob.data.buffer;
+          const dependents = pathsByHash.get(blob._id) ?? [];
+          for (const doc of dependents) {
+            writeJobs.push({ relPath: doc._id, bytes });
+          }
+        } else {
+          chunkedHeaders.push(blob);
+        }
+      }
+      for (const header of chunkedHeaders) {
+        const bytes = await assembleChunkedBlob(blobs, header);
+        const dependents = pathsByHash.get(header._id) ?? [];
         for (const doc of dependents) {
           writeJobs.push({ relPath: doc._id, bytes });
         }
@@ -171,78 +217,83 @@ export function createSyncService(
     blobs: Collection<BlobDoc>,
     lastPulledAt: string | null,
   ): Promise<number> {
-    const locals: LocalFile[] = [];
-    for (const sub of DATASTORE_SUBDIRS) {
-      await walkInto(`${cachePath}/${sub}`, sub, locals);
-    }
-
-    const localByHash = new Map<string, Uint8Array>();
-    for (const f of locals) {
-      if (!localByHash.has(f.hash)) localByHash.set(f.hash, f.bytes);
-    }
-    const remotePaths = new Map<string, PathDoc>();
-    for await (const doc of paths.find({})) remotePaths.set(doc._id, doc);
-
-    const localHashes = [...localByHash.keys()];
+    // Pre-fetch the set of blob hashes already in mongo so we can decide
+    // push-or-skip per file during the walk without buffering bytes.
+    // Filter out chunk docs (their `_id` carries `:<n>`): a hash is only
+    // "present" when its header/inline doc exists.
     const remoteBlobHashes = new Set<string>();
-    for (let i = 0; i < localHashes.length; i += BLOB_QUERY_BATCH) {
-      const batch = localHashes.slice(i, i + BLOB_QUERY_BATCH);
-      for await (
-        const b of blobs.find(
-          { _id: { $in: batch } },
-          { projection: { _id: 1 } },
-        )
-      ) {
-        remoteBlobHashes.add(b._id);
-      }
+    for await (
+      const b of blobs.find({}, { projection: { _id: 1 } })
+    ) {
+      if (!b._id.includes(":")) remoteBlobHashes.add(b._id);
     }
-    const missingHashes = localHashes.filter((h) => !remoteBlobHashes.has(h));
+
+    // Pull the path manifest with a projection so the in-memory map carries
+    // only the fields the diff/tombstone passes use.
+    const remotePaths = new Map<string, RemotePathSlim>();
+    for await (
+      const doc of paths.find(
+        {},
+        { projection: { hash: 1, deletedAt: 1, updatedAt: 1 } },
+      )
+    ) {
+      remotePaths.set(doc._id, {
+        hash: doc.hash,
+        deletedAt: doc.deletedAt,
+        updatedAt: doc.updatedAt,
+      });
+    }
+
+    // Streaming push state: one file's bytes are in memory at most.
+    const inlineOps: AnyBulkWriteOperation<BlobDoc>[] = [];
+    let inlineBytes = 0;
     let blobsPushed = 0;
-    if (missingHashes.length > 0) {
-      let i = 0;
-      while (i < missingHashes.length) {
-        const ops: { insertOne: { document: BlobDoc } }[] = [];
-        let batchBytes = 0;
-        while (
-          i < missingHashes.length &&
-          ops.length < PUSH_BULK &&
-          batchBytes < 14 * 1024 * 1024
-        ) {
-          const h = missingHashes[i++];
-          const bytes = localByHash.get(h)!;
-          batchBytes += bytes.byteLength + 64;
-          ops.push({
-            insertOne: {
-              document: {
-                _id: h,
-                size: bytes.byteLength,
-                data: new Binary(bytes),
-              },
-            },
-          });
-        }
-        try {
-          const res = await blobs.bulkWrite(ops, { ordered: false });
-          blobsPushed += res.insertedCount;
-        } catch (err) {
-          if (
-            !(err instanceof Error) ||
-            !("code" in err) ||
-            (err as { code?: number }).code !== 11000
-          ) {
-            const wErr = err as {
-              writeErrors?: Array<{ code: number }>;
-              insertedCount?: number;
-            };
-            const allDup = (wErr.writeErrors ?? []).every((e) =>
-              e.code === 11000
-            );
-            if (!allDup) throw err;
-            blobsPushed += wErr.insertedCount ?? 0;
-          }
-        }
+    const seenHashes = new Set<string>();
+
+    const flushInline = async () => {
+      if (inlineOps.length === 0) return;
+      blobsPushed += await safeBulkInsertBlobs(blobs, inlineOps);
+      inlineOps.length = 0;
+      inlineBytes = 0;
+    };
+
+    const localMetas: LocalMeta[] = [];
+    const onFile = async (relPath: string, bytes: Uint8Array) => {
+      const hash = await sha256Hex(bytes);
+      localMetas.push({ relPath, hash, size: bytes.byteLength });
+
+      if (remoteBlobHashes.has(hash) || seenHashes.has(hash)) return;
+      seenHashes.add(hash);
+
+      if (bytes.byteLength > BLOB_INLINE_MAX) {
+        await flushInline();
+        blobsPushed += await pushChunkedBlob(blobs, hash, bytes);
+        return;
       }
+      if (
+        inlineOps.length >= PUSH_BULK ||
+        inlineBytes + bytes.byteLength + 64 >= BULK_INLINE_BYTES
+      ) {
+        await flushInline();
+      }
+      inlineOps.push({
+        insertOne: {
+          document: {
+            _id: hash,
+            size: bytes.byteLength,
+            data: new Binary(bytes),
+          },
+        },
+      });
+      inlineBytes += bytes.byteLength + 64;
+    };
+
+    for (const sub of DATASTORE_SUBDIRS) {
+      await walkAndStream(`${cachePath}/${sub}`, sub, onFile);
     }
+    await flushInline();
+
+    // Path upserts — no bytes needed, just the metadata collected above.
     let pathsPushed = 0;
     let pathOps: AnyBulkWriteOperation<PathDoc>[] = [];
     const flushPathOps = async () => {
@@ -252,7 +303,7 @@ export function createSyncService(
       pathOps = [];
     };
     const now = new Date();
-    for (const f of locals) {
+    for (const f of localMetas) {
       const existing = remotePaths.get(f.relPath);
       if (
         existing &&
@@ -279,7 +330,7 @@ export function createSyncService(
 
     if (lastPulledAt !== null) {
       const watermark = new Date(lastPulledAt);
-      const localPaths = new Set(locals.map((f) => f.relPath));
+      const localPaths = new Set(localMetas.map((f) => f.relPath));
       const tombstoneOps: AnyBulkWriteOperation<PathDoc>[] = [];
       for (const [relPath, doc] of remotePaths) {
         if (localPaths.has(relPath) || doc.deletedAt !== null) continue;
@@ -357,29 +408,7 @@ export function createSyncService(
       }
     }
     const missing = localHashes.filter((h) => !remoteBlobHashes.has(h));
-    if (missing.length > 0) {
-      const ops = missing.map((h) => ({
-        insertOne: {
-          document: {
-            _id: h,
-            size: localByHash.get(h)!.byteLength,
-            data: new Binary(localByHash.get(h)!),
-          } as BlobDoc,
-        },
-      }));
-      try {
-        const res = await blobs.bulkWrite(ops, { ordered: false });
-        changes += res.insertedCount ?? 0;
-      } catch (err) {
-        const wErr = err as {
-          writeErrors?: Array<{ code: number }>;
-          insertedCount?: number;
-        };
-        const allDup = (wErr.writeErrors ?? []).every((e) => e.code === 11000);
-        if (!allDup) throw err;
-        changes += wErr.insertedCount ?? 0;
-      }
-    }
+    changes += await pushBlobsByHash(blobs, missing, localByHash);
 
     const now = new Date();
     const pathOps: AnyBulkWriteOperation<PathDoc>[] = [];
@@ -469,6 +498,152 @@ export function createSyncService(
   };
 }
 
+async function pushBlobsByHash(
+  blobs: Collection<BlobDoc>,
+  hashes: string[],
+  localByHash: Map<string, Uint8Array>,
+): Promise<number> {
+  if (hashes.length === 0) return 0;
+  const inlineHashes: string[] = [];
+  const chunkedHashes: string[] = [];
+  for (const h of hashes) {
+    const bytes = localByHash.get(h);
+    if (bytes === undefined) continue;
+    if (bytes.byteLength <= BLOB_INLINE_MAX) inlineHashes.push(h);
+    else chunkedHashes.push(h);
+  }
+
+  let pushed = 0;
+  let i = 0;
+  while (i < inlineHashes.length) {
+    const ops: AnyBulkWriteOperation<BlobDoc>[] = [];
+    let batchBytes = 0;
+    while (
+      i < inlineHashes.length &&
+      ops.length < PUSH_BULK &&
+      batchBytes < BULK_INLINE_BYTES
+    ) {
+      const h = inlineHashes[i++];
+      const bytes = localByHash.get(h)!;
+      batchBytes += bytes.byteLength + 64;
+      ops.push({
+        insertOne: {
+          document: {
+            _id: h,
+            size: bytes.byteLength,
+            data: new Binary(bytes),
+          },
+        },
+      });
+    }
+    pushed += await safeBulkInsertBlobs(blobs, ops);
+  }
+
+  for (const h of chunkedHashes) {
+    const bytes = localByHash.get(h)!;
+    pushed += await pushChunkedBlob(blobs, h, bytes);
+  }
+  return pushed;
+}
+
+async function pushChunkedBlob(
+  blobs: Collection<BlobDoc>,
+  hash: string,
+  bytes: Uint8Array,
+): Promise<number> {
+  const size = bytes.byteLength;
+  const chunkCount = Math.ceil(size / BLOB_CHUNK_BYTES);
+
+  // Insert chunks first. Dup-key on any chunk is tolerated so a previously
+  // interrupted push can finish without re-uploading completed chunks.
+  let chunksWritten = 0;
+  for (let i = 0; i < chunkCount; i++) {
+    const start = i * BLOB_CHUNK_BYTES;
+    const end = Math.min(start + BLOB_CHUNK_BYTES, size);
+    const chunkBytes = bytes.subarray(start, end);
+    chunksWritten += await safeBulkInsertBlobs(blobs, [{
+      insertOne: {
+        document: {
+          _id: `${hash}:${i}`,
+          size: chunkBytes.byteLength,
+          data: new Binary(chunkBytes),
+        },
+      },
+    }]);
+  }
+
+  // Header written last so readers never see a header pointing at missing
+  // chunks. If the header already exists, another writer beat us — treat as
+  // success.
+  const headerWritten = await safeBulkInsertBlobs(blobs, [{
+    insertOne: {
+      document: { _id: hash, size, chunkCount },
+    },
+  }]);
+  return chunksWritten + headerWritten;
+}
+
+async function assembleChunkedBlob(
+  blobs: Collection<BlobDoc>,
+  header: BlobDoc,
+): Promise<Uint8Array> {
+  const chunkCount = header.chunkCount;
+  if (chunkCount === undefined || chunkCount <= 0) {
+    throw new Error(
+      `Blob ${header._id} has neither inline data nor a positive chunkCount`,
+    );
+  }
+  const chunkIds = Array.from(
+    { length: chunkCount },
+    (_, i) => `${header._id}:${i}`,
+  );
+  const parts = new Map<number, Uint8Array>();
+  for await (
+    const doc of blobs.find({ _id: { $in: chunkIds } })
+  ) {
+    if (!doc.data) {
+      throw new Error(`Blob chunk ${doc._id} has no data field`);
+    }
+    const colon = doc._id.lastIndexOf(":");
+    const idx = parseInt(doc._id.slice(colon + 1), 10);
+    parts.set(idx, doc.data.buffer);
+  }
+  const out = new Uint8Array(header.size);
+  let offset = 0;
+  for (let i = 0; i < chunkCount; i++) {
+    const part = parts.get(i);
+    if (!part) {
+      throw new Error(`Missing chunk ${i} for blob ${header._id}`);
+    }
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
+}
+
+async function safeBulkInsertBlobs(
+  blobs: Collection<BlobDoc>,
+  ops: AnyBulkWriteOperation<BlobDoc>[],
+): Promise<number> {
+  if (ops.length === 0) return 0;
+  try {
+    const res = await blobs.bulkWrite(ops, { ordered: false });
+    return res.insertedCount ?? 0;
+  } catch (err) {
+    const wErr = err as {
+      writeErrors?: Array<{ code: number; errmsg?: string; index?: number }>;
+      insertedCount?: number;
+    };
+    const writeErrors = wErr.writeErrors ?? [];
+    const fatal = writeErrors.find(
+      (e) => e.code !== ERR_DUP_KEY && e.code !== ERR_DOC_TOO_LARGE,
+    );
+    if (fatal) throw err;
+    if (writeErrors.length === 0) throw err;
+    return wErr.insertedCount ?? 0;
+  }
+}
+
 function addToBucket<K, V>(map: Map<K, V[]>, key: K, value: V): void {
   const list = map.get(key);
   if (list) list.push(value);
@@ -491,6 +666,36 @@ async function runPool<T>(
       }
     }),
   );
+}
+
+async function walkAndStream(
+  root: string,
+  relRoot: string,
+  onFile: (relPath: string, bytes: Uint8Array) => Promise<void>,
+): Promise<void> {
+  try {
+    for await (const entry of Deno.readDir(root)) {
+      if (entry.isSymlink) continue;
+      const childAbs = `${root}/${entry.name}`;
+      const childRel = `${relRoot}/${entry.name}`;
+      if (entry.isDirectory) {
+        await walkAndStream(childAbs, childRel, onFile);
+        continue;
+      }
+      if (!entry.isFile) continue;
+      let bytes: Uint8Array;
+      try {
+        bytes = await Deno.readFile(childAbs);
+      } catch (err) {
+        if (err instanceof Deno.errors.NotFound) continue;
+        throw err;
+      }
+      await onFile(childRel, bytes);
+    }
+  } catch (err) {
+    if (err instanceof Deno.errors.NotFound) return;
+    throw err;
+  }
 }
 
 async function walkInto(
