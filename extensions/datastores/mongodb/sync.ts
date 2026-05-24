@@ -11,14 +11,27 @@ import {
 } from "./config.ts";
 import { Sidecar, type SidecarState } from "./sidecar.ts";
 
+// Mirrors @systeminit/swamp's domain/datastore/datastore_sync_service.ts.
+export interface SyncContext {
+  models?: ReadonlyArray<{ modelType: string; modelId: string }>;
+}
+
+export interface SyncCapabilities {
+  scopedSync?: boolean;
+}
+
 export interface DatastoreSyncOptions {
   signal?: AbortSignal;
   relPath?: string;
+  // Domain-level sync context, passed by core only when capabilities()
+  // advertises scopedSync. Meaningful on pull/push; ignored on markDirty.
+  context?: SyncContext;
 }
 
 export interface DatastoreSyncService {
   pullChanged(options?: DatastoreSyncOptions): Promise<number>;
   pushChanged(options?: DatastoreSyncOptions): Promise<number>;
+  capabilities?(): SyncCapabilities;
   markDirty(options?: DatastoreSyncOptions): Promise<void>;
 }
 
@@ -128,11 +141,20 @@ export function createSyncService(
     );
   }
 
-  async function pull(): Promise<number> {
+  // `prefixes`, when present, scopes the pull to `_paths` docs whose `_id`
+  // begins with one of the given cache-relative prefixes (e.g.
+  // `data/<modelType>/<modelId>/`). A scoped pull is a pure read
+  // optimization: it ignores the `lastPulledAt` floor (so it can fetch
+  // anything in-scope that's missing/stale locally) and — critically — does
+  // NOT advance the `lastPulledAt` watermark. The global watermark stays
+  // owned exclusively by the full, unscoped pull; bumping it here would make
+  // a later full pull skip every out-of-scope change in this window.
+  async function pull(prefixes?: string[]): Promise<number> {
+    const scoped = prefixes !== undefined && prefixes.length > 0;
     const { paths, blobs } = await resources();
     const state = await sidecar.read();
 
-    if (state.lastPulledAt !== null) {
+    if (!scoped && state.lastPulledAt !== null) {
       const since = new Date(state.lastPulledAt);
       const probe = await paths.findOne(
         { updatedAt: { $gt: since } },
@@ -141,10 +163,18 @@ export function createSyncService(
       if (probe === null) return 0;
     }
 
-    const filter = state.lastPulledAt !== null
+    const filter = scoped
+      ? {
+        $or: prefixes!.map((p) => ({
+          _id: { $regex: `^${escapeRegex(p)}` },
+        })),
+      }
+      : state.lastPulledAt !== null
       ? { updatedAt: { $gt: new Date(state.lastPulledAt) } }
       : {};
-    const coldStart = state.lastPulledAt === null;
+    // A scoped pull always hash-compares against local state (never the
+    // cold-start bulk path) — it has no watermark history to lean on.
+    const coldStart = !scoped && state.lastPulledAt === null;
 
     const pathDocs: PathDoc[] = [];
     let maxUpdatedAtMs = state.lastPulledAt !== null
@@ -205,10 +235,12 @@ export function createSyncService(
       });
     }
 
-    const watermark = maxUpdatedAtMs > 0
-      ? new Date(maxUpdatedAtMs).toISOString()
-      : new Date().toISOString();
-    await sidecar.setLastPulledAt(watermark);
+    if (!scoped) {
+      const watermark = maxUpdatedAtMs > 0
+        ? new Date(maxUpdatedAtMs).toISOString()
+        : new Date().toISOString();
+      await sidecar.setLastPulledAt(watermark);
+    }
     return changes;
   }
 
@@ -469,7 +501,14 @@ export function createSyncService(
   }
 
   return {
-    async pushChanged(): Promise<number> {
+    capabilities(): SyncCapabilities {
+      return { scopedSync: true };
+    },
+
+    // The dirty sidecar remains the authoritative source of what to push;
+    // `context.models` is advisory (matches the s3 reference, whose push
+    // stays diff-driven). We don't scope the push by it.
+    async pushChanged(_options?: DatastoreSyncOptions): Promise<number> {
       const { paths, blobs } = await resources();
       const state = await sidecar.read();
 
@@ -488,14 +527,25 @@ export function createSyncService(
       return changes;
     },
 
-    pullChanged(): Promise<number> {
-      return pull();
+    pullChanged(options?: DatastoreSyncOptions): Promise<number> {
+      const prefixes = modelPrefixes(options?.context?.models);
+      return prefixes.length > 0 ? pull(prefixes) : pull();
     },
 
     markDirty(options?: DatastoreSyncOptions): Promise<void> {
       return sidecar.recordDirty(options?.relPath).then(() => undefined);
     },
   };
+}
+
+// Maps a scoped-sync model list to the cache-relative path prefixes that hold
+// each model's bytes. Mirrors swamp core's per-model lock key root
+// (`data/<modelType>/<modelId>/.lock`) and the s3 reference's pull scope.
+export function modelPrefixes(
+  models: ReadonlyArray<{ modelType: string; modelId: string }> | undefined,
+): string[] {
+  if (!models || models.length === 0) return [];
+  return models.map((m) => `data/${m.modelType}/${m.modelId}/`);
 }
 
 async function pushBlobsByHash(

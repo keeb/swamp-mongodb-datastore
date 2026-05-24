@@ -1,5 +1,25 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { Sidecar } from "./sidecar.ts";
+import { modelPrefixes } from "./sync.ts";
+
+Deno.test("modelPrefixes maps models to data/<type>/<id>/ prefixes", () => {
+  assertEquals(
+    modelPrefixes([{ modelType: "host", modelId: "vm-1" }]),
+    ["data/host/vm-1/"],
+  );
+  assertEquals(
+    modelPrefixes([
+      { modelType: "host", modelId: "vm-1" },
+      { modelType: "net", modelId: "br0" },
+    ]),
+    ["data/host/vm-1/", "data/net/br0/"],
+  );
+});
+
+Deno.test("modelPrefixes returns [] for empty/undefined (falls back to full pull)", () => {
+  assertEquals(modelPrefixes(undefined), []);
+  assertEquals(modelPrefixes([]), []);
+});
 
 async function withTempCache(
   fn: (cachePath: string) => Promise<void>,
