@@ -18,6 +18,7 @@ export interface SyncContext {
 
 export interface SyncCapabilities {
   scopedSync?: boolean;
+  lazyHydration?: boolean;
 }
 
 export interface DatastoreSyncOptions {
@@ -26,6 +27,10 @@ export interface DatastoreSyncOptions {
   // Domain-level sync context, passed by core only when capabilities()
   // advertises scopedSync. Meaningful on pull/push; ignored on markDirty.
   context?: SyncContext;
+  // When true (set by core on a `--hydration-strategy lazy` setup pull),
+  // pullChanged downloads catalog metadata only and skips `data/.../raw`
+  // content. Honored only when capabilities() advertises lazyHydration.
+  metadataOnly?: boolean;
 }
 
 export interface DatastoreSyncService {
@@ -33,6 +38,14 @@ export interface DatastoreSyncService {
   pushChanged(options?: DatastoreSyncOptions): Promise<number>;
   capabilities?(): SyncCapabilities;
   markDirty(options?: DatastoreSyncOptions): Promise<void>;
+  // Downloads a single cache-relative file the lazy setup pull skipped.
+  // Core calls this transparently when a read-only command needs missing
+  // content. Returns true if downloaded (or already present), false if the
+  // remote has no live manifest doc for relPath.
+  hydrateFile?(
+    relPath: string,
+    options?: DatastoreSyncOptions,
+  ): Promise<boolean>;
 }
 
 const DATASTORE_SUBDIRS = [
@@ -109,6 +122,21 @@ const BULK_INLINE_BYTES = 14 * 1024 * 1024;
 // MongoDB error codes we tolerate per-op without aborting the batch.
 const ERR_DUP_KEY = 11000;
 const ERR_DOC_TOO_LARGE = 10334;
+// Cache-relative paths holding model content bytes: `data/<type>/<id>/.../raw`.
+// A metadataOnly pull excludes these and leaves them to lazy hydration.
+const RAW_CONTENT_RE = /^data\/.*\/raw$/;
+
+// Fresh regex per call: a `RegExp` carries `lastIndex` state and is reused
+// across queries here, so we hand Mongo its own instance each time.
+export function rawContentRegex(): RegExp {
+  return new RegExp(RAW_CONTENT_RE.source);
+}
+
+// True for cache-relative paths a metadataOnly pull skips (model content
+// bytes). Catalog files (`metadata.yaml`, `latest`) return false.
+export function isRawContentPath(relPath: string): boolean {
+  return RAW_CONTENT_RE.test(relPath);
+}
 
 export function createSyncService(
   cfg: MongoDatastoreConfig,
@@ -149,9 +177,19 @@ export function createSyncService(
   // NOT advance the `lastPulledAt` watermark. The global watermark stays
   // owned exclusively by the full, unscoped pull; bumping it here would make
   // a later full pull skip every out-of-scope change in this window.
-  async function pull(prefixes?: string[]): Promise<number> {
+  async function pull(opts?: {
+    prefixes?: string[];
+    metadataOnly?: boolean;
+  }): Promise<number> {
+    const prefixes = opts?.prefixes;
+    const metadataOnly = opts?.metadataOnly === true;
     const scoped = prefixes !== undefined && prefixes.length > 0;
     const { paths, blobs } = await resources();
+    // A metadataOnly pull leaves data/.../raw un-hydrated. Mark the cache so
+    // a later pushChanged won't read those absent raw files as deletions and
+    // tombstone the whole corpus. Set before the no-op early return so even a
+    // metadataOnly pull that finds nothing new still records lazy mode.
+    if (metadataOnly) await sidecar.setLazyPullActive(true);
     const state = await sidecar.read();
 
     if (!scoped && state.lastPulledAt !== null) {
@@ -163,7 +201,7 @@ export function createSyncService(
       if (probe === null) return 0;
     }
 
-    const filter = scoped
+    const baseFilter = scoped
       ? {
         $or: prefixes!.map((p) => ({
           _id: { $regex: `^${escapeRegex(p)}` },
@@ -172,6 +210,13 @@ export function createSyncService(
       : state.lastPulledAt !== null
       ? { updatedAt: { $gt: new Date(state.lastPulledAt) } }
       : {};
+    // metadataOnly: keep the catalog (metadata.yaml, latest) but skip the
+    // bulky `data/<type>/<id>/.../raw` content so `data list`/`query`/CEL
+    // work immediately. The skipped files are fetched on demand by
+    // hydrateFile when a read actually needs them.
+    const filter = metadataOnly
+      ? { $and: [baseFilter, { _id: { $not: rawContentRegex() } }] }
+      : baseFilter;
     // A scoped pull always hash-compares against local state (never the
     // cold-start bulk path) — it has no watermark history to lean on.
     const coldStart = !scoped && state.lastPulledAt === null;
@@ -235,12 +280,20 @@ export function createSyncService(
       });
     }
 
-    if (!scoped) {
+    if (!scoped && !metadataOnly) {
+      // Full unscoped pull: the cache now mirrors the remote, so advance the
+      // watermark and clear lazy mode — the next push may safely tombstone
+      // absent paths again.
       const watermark = maxUpdatedAtMs > 0
         ? new Date(maxUpdatedAtMs).toISOString()
         : new Date().toISOString();
       await sidecar.setLastPulledAt(watermark);
+      await sidecar.setLazyPullActive(false);
     }
+    // A metadataOnly pull deliberately does NOT advance the watermark: doing
+    // so would move it past the skipped data/.../raw docs, and a later full
+    // pull (filtered by updatedAt > watermark) would then never re-fetch
+    // them. Leaving the watermark put keeps those raw docs reachable.
     return changes;
   }
 
@@ -248,6 +301,7 @@ export function createSyncService(
     paths: Collection<PathDoc>,
     blobs: Collection<BlobDoc>,
     lastPulledAt: string | null,
+    lazyPullActive: boolean,
   ): Promise<number> {
     // Pre-fetch the set of blob hashes already in mongo so we can decide
     // push-or-skip per file during the walk without buffering bytes.
@@ -360,7 +414,11 @@ export function createSyncService(
     }
     await flushPathOps();
 
-    if (lastPulledAt !== null) {
+    // Reconciliation tombstones: skipped entirely while a lazy pull is active.
+    // The local cache is then an incomplete mirror (data/.../raw is absent),
+    // so an absent path is "never hydrated," not "deleted." Deletions resume
+    // propagating once a full pull clears lazyPullActive.
+    if (lastPulledAt !== null && !lazyPullActive) {
       const watermark = new Date(lastPulledAt);
       const localPaths = new Set(localMetas.map((f) => f.relPath));
       const tombstoneOps: AnyBulkWriteOperation<PathDoc>[] = [];
@@ -390,6 +448,7 @@ export function createSyncService(
     blobs: Collection<BlobDoc>,
     relPath: string,
     lastPulledAt: string | null,
+    lazyPullActive: boolean,
   ): Promise<number> {
     const absPath = `${cachePath}/${relPath}`;
     let stat: Deno.FileInfo | null = null;
@@ -474,7 +533,9 @@ export function createSyncService(
       );
     }
 
-    if (lastPulledAt !== null) {
+    // Same lazy guard as fullWalkPush: don't tombstone within this subtree
+    // while the cache is an incomplete (lazy) mirror.
+    if (lastPulledAt !== null && !lazyPullActive) {
       const watermark = new Date(lastPulledAt);
       const localPaths = new Set(local.map((f) => f.relPath));
       const tombstoneOps: AnyBulkWriteOperation<PathDoc>[] = [];
@@ -502,7 +563,7 @@ export function createSyncService(
 
   return {
     capabilities(): SyncCapabilities {
-      return { scopedSync: true };
+      return { scopedSync: true, lazyHydration: true };
     },
 
     // The dirty sidecar remains the authoritative source of what to push;
@@ -511,9 +572,15 @@ export function createSyncService(
     async pushChanged(_options?: DatastoreSyncOptions): Promise<number> {
       const { paths, blobs } = await resources();
       const state = await sidecar.read();
+      const lazy = state.lazyPullActive;
 
       if (state.bulkInvalidated) {
-        const changes = await fullWalkPush(paths, blobs, state.lastPulledAt);
+        const changes = await fullWalkPush(
+          paths,
+          blobs,
+          state.lastPulledAt,
+          lazy,
+        );
         await sidecar.clearDirty();
         return changes;
       }
@@ -521,7 +588,13 @@ export function createSyncService(
       if (state.dirtyPaths.length === 0) return 0;
       let changes = 0;
       for (const relPath of state.dirtyPaths) {
-        changes += await pushOneRel(paths, blobs, relPath, state.lastPulledAt);
+        changes += await pushOneRel(
+          paths,
+          blobs,
+          relPath,
+          state.lastPulledAt,
+          lazy,
+        );
       }
       await sidecar.clearDirty();
       return changes;
@@ -529,11 +602,33 @@ export function createSyncService(
 
     pullChanged(options?: DatastoreSyncOptions): Promise<number> {
       const prefixes = modelPrefixes(options?.context?.models);
-      return prefixes.length > 0 ? pull(prefixes) : pull();
+      return pull({
+        prefixes: prefixes.length > 0 ? prefixes : undefined,
+        metadataOnly: options?.metadataOnly,
+      });
     },
 
     markDirty(options?: DatastoreSyncOptions): Promise<void> {
       return sidecar.recordDirty(options?.relPath).then(() => undefined);
+    },
+
+    // Single-file hydration: one manifest lookup by path key, then one blob
+    // fetch by content hash (assembling chunks for >15 MB blobs). No
+    // watermark or sidecar interaction — this is a pure on-demand read of a
+    // file the lazy setup pull deliberately skipped.
+    async hydrateFile(relPath: string): Promise<boolean> {
+      const { paths, blobs } = await resources();
+      const doc = await paths.findOne({ _id: relPath });
+      if (doc === null || doc.deletedAt !== null) return false;
+
+      const absPath = `${cachePath}/${relPath}`;
+      const local = await readFileOrNull(absPath);
+      if (local !== null && (await sha256Hex(local)) === doc.hash) return true;
+
+      const bytes = await fetchBlobBytes(blobs, doc.hash);
+      if (bytes === null) return false;
+      await writeFileAtomic(absPath, bytes);
+      return true;
     },
   };
 }
@@ -631,6 +726,18 @@ async function pushChunkedBlob(
     },
   }]);
   return chunksWritten + headerWritten;
+}
+
+// Fetches a blob's full bytes by content hash, transparently assembling
+// chunked blobs. Returns null when no blob doc exists for the hash.
+async function fetchBlobBytes(
+  blobs: Collection<BlobDoc>,
+  hash: string,
+): Promise<Uint8Array | null> {
+  const blob = await blobs.findOne({ _id: hash });
+  if (blob === null) return null;
+  if (blob.data) return blob.data.buffer;
+  return await assembleChunkedBlob(blobs, blob);
 }
 
 async function assembleChunkedBlob(

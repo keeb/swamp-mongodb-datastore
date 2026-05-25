@@ -1,6 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { Sidecar } from "./sidecar.ts";
-import { modelPrefixes } from "./sync.ts";
+import { isRawContentPath, modelPrefixes } from "./sync.ts";
 
 Deno.test("modelPrefixes maps models to data/<type>/<id>/ prefixes", () => {
   assertEquals(
@@ -19,6 +19,21 @@ Deno.test("modelPrefixes maps models to data/<type>/<id>/ prefixes", () => {
 Deno.test("modelPrefixes returns [] for empty/undefined (falls back to full pull)", () => {
   assertEquals(modelPrefixes(undefined), []);
   assertEquals(modelPrefixes([]), []);
+});
+
+Deno.test("isRawContentPath matches data/.../raw content, spares catalog files", () => {
+  // Skipped by a metadataOnly pull (content bytes).
+  assertEquals(isRawContentPath("data/host/vm-1/versions/abc/raw"), true);
+  assertEquals(isRawContentPath("data/host/vm-1/raw"), true);
+  // Kept by a metadataOnly pull (catalog: list/query/CEL work without bytes).
+  assertEquals(
+    isRawContentPath("data/host/vm-1/versions/abc/metadata.yaml"),
+    false,
+  );
+  assertEquals(isRawContentPath("data/host/vm-1/latest"), false);
+  // `raw` only counts under data/, and only as the trailing segment.
+  assertEquals(isRawContentPath("outputs/host/vm-1/raw"), false);
+  assertEquals(isRawContentPath("data/host/raw/metadata.yaml"), false);
 });
 
 async function withTempCache(
@@ -130,6 +145,35 @@ Deno.test("concurrent recordDirty calls serialize without losing entries", async
     const state = await sc.read();
     assertEquals(state.dirtyPaths.length, 50);
     assertEquals(new Set(state.dirtyPaths).size, 50);
+  });
+});
+
+Deno.test("lazyPullActive survives clearDirty (a push doesn't hydrate)", async () => {
+  await withTempCache(async (cache) => {
+    const sc = new Sidecar(cache);
+    await sc.setLazyPullActive(true);
+    // A push clears dirty state but must NOT clear the lazy flag, or the
+    // next fullWalkPush would tombstone un-hydrated raw content.
+    const afterClear = await sc.clearDirty();
+    assertEquals(afterClear.lazyPullActive, true);
+    const fresh = await new Sidecar(cache).read();
+    assertEquals(fresh.lazyPullActive, true);
+  });
+});
+
+Deno.test("setLazyPullActive(false) clears the flag (full pull resync)", async () => {
+  await withTempCache(async (cache) => {
+    const sc = new Sidecar(cache);
+    await sc.setLazyPullActive(true);
+    const state = await sc.setLazyPullActive(false);
+    assertEquals(state.lazyPullActive, false);
+  });
+});
+
+Deno.test("lazyPullActive defaults false on cold start", async () => {
+  await withTempCache(async (cache) => {
+    const state = await new Sidecar(cache).read();
+    assertEquals(state.lazyPullActive, false);
   });
 });
 

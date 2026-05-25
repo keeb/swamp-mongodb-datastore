@@ -25,6 +25,13 @@ export interface SidecarState {
   dirtyPaths: string[];
   bulkInvalidated: boolean;
   lastPulledAt: string | null;
+  // True while this cache holds an un-hydrated tree: set by a metadataOnly
+  // (lazy) pull, cleared by a full (non-metadataOnly, unscoped) pull that
+  // brings the cache fully in sync. While true, the local cache is NOT a
+  // complete mirror of the remote, so the push reconciliation pass must not
+  // read an absent path as a deletion. Survives clearDirty (a push doesn't
+  // hydrate anything). Mirrors the S3/GCS reference's lazyPullActive.
+  lazyPullActive: boolean;
 }
 
 function emptyState(): SidecarState {
@@ -33,6 +40,7 @@ function emptyState(): SidecarState {
     dirtyPaths: [],
     bulkInvalidated: false,
     lastPulledAt: null,
+    lazyPullActive: false,
   };
 }
 
@@ -80,11 +88,13 @@ function normalize(parsed: unknown): SidecarState {
   const lastPulledAt = typeof obj.lastPulledAt === "string"
     ? obj.lastPulledAt
     : null;
+  const lazyPullActive = obj.lazyPullActive === true;
   return {
     version: CURRENT_SCHEMA_VERSION,
     dirtyPaths,
     bulkInvalidated,
     lastPulledAt,
+    lazyPullActive,
   };
 }
 
@@ -150,6 +160,12 @@ export class Sidecar {
   setLastPulledAt(iso: string): Promise<SidecarState> {
     return this.update((state) => {
       state.lastPulledAt = iso;
+    });
+  }
+
+  setLazyPullActive(active: boolean): Promise<SidecarState> {
+    return this.update((state) => {
+      state.lazyPullActive = active;
     });
   }
 }
