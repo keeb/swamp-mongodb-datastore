@@ -1,6 +1,6 @@
 import { assertEquals } from "jsr:@std/assert@1";
 import { Sidecar } from "./sidecar.ts";
-import { isRawContentPath, modelPrefixes } from "./sync.ts";
+import { isRawContentPath, isSecretsPath, modelPrefixes } from "./sync.ts";
 
 Deno.test("modelPrefixes maps models to data/<type>/<id>/ prefixes", () => {
   assertEquals(
@@ -34,6 +34,17 @@ Deno.test("isRawContentPath matches data/.../raw content, spares catalog files",
   // `raw` only counts under data/, and only as the trailing segment.
   assertEquals(isRawContentPath("outputs/host/vm-1/raw"), false);
   assertEquals(isRawContentPath("data/host/raw/metadata.yaml"), false);
+});
+
+Deno.test("isSecretsPath matches the vault tier only", () => {
+  // Excluded from sync (vault keys + ciphertext must not reach MongoDB).
+  assertEquals(isSecretsPath("secrets"), true);
+  assertEquals(isSecretsPath("secrets/local_encryption/v/.key"), true);
+  assertEquals(isSecretsPath("secrets/local_encryption/v/KEY.enc"), true);
+  // Unrelated paths sync normally.
+  assertEquals(isSecretsPath("data/host/vm-1/raw"), false);
+  assertEquals(isSecretsPath("secretsanta/foo"), false);
+  assertEquals(isSecretsPath("outputs/secrets/foo"), false);
 });
 
 async function withTempCache(
@@ -174,6 +185,46 @@ Deno.test("lazyPullActive defaults false on cold start", async () => {
   await withTempCache(async (cache) => {
     const state = await new Sidecar(cache).read();
     assertEquals(state.lazyPullActive, false);
+  });
+});
+
+Deno.test("pushBootstrapped defaults false on cold start", async () => {
+  await withTempCache(async (cache) => {
+    const state = await new Sidecar(cache).read();
+    assertEquals(state.pushBootstrapped, false);
+  });
+});
+
+Deno.test("clearDirty marks pushBootstrapped true (a push completed)", async () => {
+  await withTempCache(async (cache) => {
+    const sc = new Sidecar(cache);
+    const state = await sc.clearDirty();
+    assertEquals(state.pushBootstrapped, true);
+    const fresh = await new Sidecar(cache).read();
+    assertEquals(fresh.pushBootstrapped, true);
+  });
+});
+
+Deno.test("a pull (setLastPulledAt) does NOT bootstrap push (issue #4)", async () => {
+  await withTempCache(async (cache) => {
+    const sc = new Sidecar(cache);
+    // Simulate setup: migrate copies files, then hydration sets a clean
+    // watermark — but nothing has been pushed yet. pushBootstrapped must
+    // stay false so the next pushChanged still does a full walk.
+    await sc.setLastPulledAt("2026-06-13T12:00:00.000Z");
+    const state = await new Sidecar(cache).read();
+    assertEquals(state.pushBootstrapped, false);
+    assertEquals(state.lastPulledAt, "2026-06-13T12:00:00.000Z");
+  });
+});
+
+Deno.test("pushBootstrapped survives a later pull", async () => {
+  await withTempCache(async (cache) => {
+    const sc = new Sidecar(cache);
+    await sc.clearDirty(); // push happened → bootstrapped
+    await sc.setLastPulledAt("2026-06-13T12:00:00.000Z"); // later pull
+    const state = await new Sidecar(cache).read();
+    assertEquals(state.pushBootstrapped, true);
   });
 });
 

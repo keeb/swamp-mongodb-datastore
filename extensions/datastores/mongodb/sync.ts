@@ -48,13 +48,20 @@ export interface DatastoreSyncService {
   ): Promise<boolean>;
 }
 
+// `secrets` is deliberately absent: the `local_encryption` vault stores each
+// vault's symmetric `.key` right next to its `.enc` ciphertext, so syncing the
+// tier would land both in the shared MongoDB and let anyone with read access
+// decrypt every secret (encryption-at-rest defeated). Secrets stay per-host;
+// use a real KMS-backed vault if secrets must travel. See isSecretsPath, which
+// also blocks any pre-existing remote `secrets/*` docs from being pulled back
+// into a cache. (Repo-root `.swamp/secrets` relocation/deletion during
+// `datastore setup` is a swamp-core migration concern, not this extension's.)
 const DATASTORE_SUBDIRS = [
   "definitions-evaluated",
   "workflows-evaluated",
   "data",
   "outputs",
   "workflow-runs",
-  "secrets",
   "bundles",
   "vault-bundles",
   "driver-bundles",
@@ -136,6 +143,15 @@ export function rawContentRegex(): RegExp {
 // bytes). Catalog files (`metadata.yaml`, `latest`) return false.
 export function isRawContentPath(relPath: string): boolean {
   return RAW_CONTENT_RE.test(relPath);
+}
+
+// True for the vault `secrets/` tier, which must never be synced to the shared
+// MongoDB (see DATASTORE_SUBDIRS). Enforced on both legs: push never walks the
+// tier (it's out of DATASTORE_SUBDIRS) and is guarded in markDirty/pushOneRel;
+// pull skips these docs so a deployment that synced secrets under an older
+// version cannot re-hydrate them into a cache.
+export function isSecretsPath(relPath: string): boolean {
+  return relPath === "secrets" || relPath.startsWith("secrets/");
 }
 
 export function createSyncService(
@@ -226,9 +242,13 @@ export function createSyncService(
       ? new Date(state.lastPulledAt).getTime()
       : 0;
     for await (const doc of paths.find(filter)) {
-      pathDocs.push(doc);
       const ms = doc.updatedAt.getTime();
       if (ms > maxUpdatedAtMs) maxUpdatedAtMs = ms;
+      // Never hydrate vault secrets, even if an older version synced them.
+      // Advance the watermark past the doc (above) so it isn't re-scanned,
+      // but don't write or delete it locally.
+      if (isSecretsPath(doc._id)) continue;
+      pathDocs.push(doc);
     }
 
     const concurrency = poolConcurrency();
@@ -450,6 +470,9 @@ export function createSyncService(
     lastPulledAt: string | null,
     lazyPullActive: boolean,
   ): Promise<number> {
+    // Belt-and-suspenders: markDirty already drops secrets, so this only
+    // fires if a dirty path slipped through. Never push the vault tier.
+    if (isSecretsPath(relPath)) return 0;
     const absPath = `${cachePath}/${relPath}`;
     let stat: Deno.FileInfo | null = null;
     try {
@@ -574,7 +597,16 @@ export function createSyncService(
       const state = await sidecar.read();
       const lazy = state.lazyPullActive;
 
-      if (state.bulkInvalidated) {
+      // First push from this cache must be a full walk so whatever is already
+      // on disk gets bootstrapped to the remote — the per-path dirty tracker
+      // only knows about writes since it started. `markDirty` on a missing
+      // sidecar sets bulkInvalidated, but a `pullChanged` that runs first
+      // (e.g. setup migrates files, then hydrates) writes a *clean* sidecar
+      // and erases that signal, so the migrated cache would never be pushed
+      // (issue #4). `pushBootstrapped` survives a pull and is only set true
+      // by a completed push, so it closes that gap and also re-pushes the
+      // content of any deployment that already hit the bug.
+      if (state.bulkInvalidated || !state.pushBootstrapped) {
         const changes = await fullWalkPush(
           paths,
           blobs,
@@ -609,7 +641,13 @@ export function createSyncService(
     },
 
     markDirty(options?: DatastoreSyncOptions): Promise<void> {
-      return sidecar.recordDirty(options?.relPath).then(() => undefined);
+      const relPath = options?.relPath;
+      // Drop dirty signals for the vault tier — it never syncs (see
+      // isSecretsPath). A bulk invalidation (no relPath) still records.
+      if (relPath !== undefined && isSecretsPath(relPath)) {
+        return Promise.resolve();
+      }
+      return sidecar.recordDirty(relPath).then(() => undefined);
     },
 
     // Single-file hydration: one manifest lookup by path key, then one blob
@@ -617,6 +655,8 @@ export function createSyncService(
     // watermark or sidecar interaction — this is a pure on-demand read of a
     // file the lazy setup pull deliberately skipped.
     async hydrateFile(relPath: string): Promise<boolean> {
+      // The vault tier never syncs, so there's nothing to hydrate.
+      if (isSecretsPath(relPath)) return false;
       const { paths, blobs } = await resources();
       const doc = await paths.findOne({ _id: relPath });
       if (doc === null || doc.deletedAt !== null) return false;

@@ -32,6 +32,15 @@ export interface SidecarState {
   // read an absent path as a deletion. Survives clearDirty (a push doesn't
   // hydrate anything). Mirrors the S3/GCS reference's lazyPullActive.
   lazyPullActive: boolean;
+  // True once a push has run against this cache. Until then the per-path
+  // dirty tracker can't be trusted (it only knows writes since it started),
+  // so the next push must do a full walk to bootstrap the remote from
+  // whatever's already on disk. Unlike bulkInvalidated, this survives a
+  // pullChanged: a clean sidecar written by hydration must not erase the
+  // obligation to push pre-existing cache content (issue #4). A sidecar that
+  // predates this field reads false, so an already-migrated-but-unpushed
+  // cache self-heals on its next push.
+  pushBootstrapped: boolean;
 }
 
 function emptyState(): SidecarState {
@@ -41,6 +50,7 @@ function emptyState(): SidecarState {
     bulkInvalidated: false,
     lastPulledAt: null,
     lazyPullActive: false,
+    pushBootstrapped: false,
   };
 }
 
@@ -89,12 +99,14 @@ function normalize(parsed: unknown): SidecarState {
     ? obj.lastPulledAt
     : null;
   const lazyPullActive = obj.lazyPullActive === true;
+  const pushBootstrapped = obj.pushBootstrapped === true;
   return {
     version: CURRENT_SCHEMA_VERSION,
     dirtyPaths,
     bulkInvalidated,
     lastPulledAt,
     lazyPullActive,
+    pushBootstrapped,
   };
 }
 
@@ -154,6 +166,9 @@ export class Sidecar {
     return this.update((state) => {
       state.dirtyPaths = [];
       state.bulkInvalidated = false;
+      // A push just completed, so the cache is bootstrapped to the remote;
+      // future pushes can trust the per-path dirty tracker.
+      state.pushBootstrapped = true;
     });
   }
 

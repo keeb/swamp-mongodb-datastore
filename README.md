@@ -86,8 +86,28 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
 
 - **Vault secrets do not travel.** Swamp's `local_encryption` vault reads and
   writes `<repoDir>/.swamp/secrets/...` on local disk regardless of datastore.
-  With this extension, vault contents are per-host — not shared. Use a non-local
-  vault backend if you need cross-host secrets.
+  This extension excludes the `secrets/` tier from sync entirely — neither the
+  symmetric `.key` files nor their `.enc` ciphertext are ever pushed to MongoDB,
+  and any `secrets/*` docs left in the remote by an older version are skipped on
+  pull. Vault contents stay per-host; use a non-local (KMS-backed) vault if you
+  need cross-host secrets.
+
+  > **Security note (versions ≤ 2026.05.25.1):** earlier releases listed
+  > `secrets` in the synced tier, so a repo that switched to this datastore
+  > pushed every vault `.key` next to its `.enc` ciphertext into the shared
+  > MongoDB — anyone with read access could decrypt them (CVE-class
+  > encryption-at-rest defeat). After upgrading, **rotate every secret that was
+  > synced** and purge the leaked docs from MongoDB, e.g.:
+  >
+  > ```js
+  > // hashes of the now-orphaned secret blobs, to drop after tombstoning paths
+  > const hashes = db["<prefix>_paths"].find(
+  >   { _id: /^secrets\// },
+  >   { hash: 1 },
+  > ).map((d) => d.hash);
+  > db["<prefix>_paths"].deleteMany({ _id: /^secrets\// });
+  > db["<prefix>_blobs"].deleteMany({ _id: { $in: hashes } });
+  > ```
 - **TTL must exceed your critical section.** The lock's nonce fences `release` /
   `forceRelease` only; it does not fence writes performed inside the critical
   section. If a holder pauses past TTL, another process can legitimately take
