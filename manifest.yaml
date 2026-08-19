@@ -15,3 +15,7 @@ additionalFiles:
   - LICENSE.txt
 datastores:
   - mongodb/mod.ts
+models:
+  - maintenance.ts
+workflows:
+  - datastore-maintenance/workflow.yaml

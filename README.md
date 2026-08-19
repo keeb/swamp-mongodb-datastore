@@ -166,19 +166,49 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   `swamp data gc` — on one real repo that took `data/` from 229,598 files to
   1,258. `autoGc: true` in `.swamp.yaml` did **not** keep up; schedule it.
 
-- **Run all of the above periodically.** `scripts/maintain.sh` walks every local
-  checkout using this datastore and runs `swamp data gc` then `blob-gc`, in that
-  order (the sweep only has work once gc has produced deletions):
+- **Run all of the above as a workflow.** The extension ships a companion model
+  type, `@keeb/mongodb-datastore/maintenance`, so reclamation composes into
+  swamp rather than sitting in a shell script beside it. A `DatastoreProvider`
+  has no method surface a workflow can call; this model closes that gap, using
+  the same sweep functions the CLI uses.
 
   ```bash
-  scripts/maintain.sh --dry-run     # report across all repos
-  scripts/maintain.sh --confirm
-  scripts/maintain.sh --confirm --compact
+  swamp vault create local_encryption datastore-vault
+  swamp vault put datastore-vault MONGO_PASSWORD
+
+  swamp model create @keeb/mongodb-datastore/maintenance datastoreMaintenance \
+    --global-arg uri='mongodb://mongo.example.com:27017/?replicaSet=rs0&authSource=admin' \
+    --global-arg username=swamp-user \
+    --global-arg 'password=${{ vault.get(datastore-vault, MONGO_PASSWORD) }}' \
+    --global-arg database=swamp --global-arg tenantId=my-org
+
+  swamp workflow run @keeb/datastore-maintenance
+  ```
+
+  Three methods, each fanning out over every namespace in one execution —
+  looping `model method run` against a single model serializes on its lock:
+
+  | Method      | Does                                                                  |
+  | ----------- | --------------------------------------------------------------------- |
+  | `inventory` | Live paths, tombstones, blobs, allocated vs reusable bytes, idle days |
+  | `sweep`     | Prune tombstones past grace + blobs no live path references           |
+  | `compact`   | Return freed space to the filesystem                                  |
+
+  `sweep` defaults to `dryRun: true` — opt in to deletion. It also refuses to
+  sweep blobs in a namespace that is both actively written and holding only
+  pre-`createdAt` blobs, recording `blobsSkipped` and `skipReason` in its output
+  instead of racing an in-flight push.
+
+  Results are ordinary swamp data, tagged with workflow provenance:
+
+  ```bash
+  swamp data query 'modelName == "datastoreMaintenance" && specName == "sweep"'
   ```
 
   This is the piece that prevents a repeat. The incident that motivated the
   2026.08.19.1 rewrite was not a protocol bug — it was retention drift nobody
-  was watching.
+  was watching. Pair it with `swamp data gc`, which is what actually keeps the
+  corpus small; everything here cleans up after it.
 
 ## Important Information
 

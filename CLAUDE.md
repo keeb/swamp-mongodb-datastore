@@ -51,9 +51,17 @@ you're targeting.
   - `lock.ts` — TTL lock with heartbeat + nonce fencing
   - `sync.ts` — manifest + content-addressed blob sync of the datastore tier
   - `sidecar.ts` — scalar sync state + the append-only dirty journal
-  - `maintenance.ts` / `blob_gc.ts` — orphaned-blob reclamation
+  - `maintenance.ts` / `blob_gc.ts` — reclamation logic + its CLI
     (`deno task blob-gc`)
   - `verifier.ts` — replica-set health check
+
+  `extensions/models/maintenance.ts` is the companion **model** type
+  (`@keeb/mongodb-datastore/maintenance`) wrapping the same reclamation
+  functions as `inventory` / `sweep` / `compact` methods, plus
+  `workflows/datastore-maintenance/workflow.yaml` chaining them. A
+  `DatastoreProvider` exposes nothing a workflow can call, so without this,
+  maintenance could only ever be a script bolted on beside swamp — which is
+  exactly what SWAMP.md rules 9 and 10 say not to do.
 
   Root `manifest.yaml` is the publishable package manifest.
 - **Secrets:** the mongo password comes from `$MONGO_PASSWORD` (env var name
