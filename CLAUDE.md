@@ -50,6 +50,9 @@ you're targeting.
   - `config.ts` — Zod `ConfigSchema`, collection naming, `.env` loader
   - `lock.ts` — TTL lock with heartbeat + nonce fencing
   - `sync.ts` — manifest + content-addressed blob sync of the datastore tier
+  - `sidecar.ts` — scalar sync state + the append-only dirty journal
+  - `maintenance.ts` / `blob_gc.ts` — orphaned-blob reclamation
+    (`deno task blob-gc`)
   - `verifier.ts` — replica-set health check
 
   Root `manifest.yaml` is the publishable package manifest.
@@ -79,6 +82,25 @@ you're targeting.
    server-side. Blobs ride inline as `Binary` (under MongoDB's 16MB BSON limit).
    No GridFS — the per-file `find`/chunk-read overhead it imposes is what made
    the previous protocol RTT-bound on tiny-file workloads.
+5. **Dirty tracking is a journal, not a document.** `markDirty` appends a line
+   to `.datastore-dirty.log`; only scalars live in `.datastore-sync-state.json`.
+   Keeping `dirtyPaths` inside the JSON made every `markDirty` a
+   read-modify-write plus a linear `includes` scan — on a repo that had
+   accumulated ~86k dirty paths, 13.6 MB of I/O and ~86k string compares per
+   dirtied file, under the global lock. On push the journal is coalesced so a
+   dirty directory absorbs everything beneath it, and past `MAX_DIRTY_PATHS` it
+   degrades to one full walk.
+6. **Two watermarks.** `lastPulledAt` = content hydrated to here (drives pull).
+   `lastReconciledAt` = complete remote path list observed to here (drives the
+   push tombstone pass). Conflating them means a host can never propagate
+   deletion of data it pushed itself, because its own push stamps
+   `updatedAt = now`, and the tombstone pass skips anything newer than the
+   watermark in order to protect a peer's concurrent writes.
+7. **`_blobs` is append-only; reclamation is out of band.** Dedup means a push
+   can't tell whether another path still references a hash, so it must never
+   delete. `blob_gc.ts` sweeps unreferenced blobs while holding the global lock
+   — required, since a push inserts a blob before the path doc that references
+   it.
 
 ## Verification
 

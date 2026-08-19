@@ -79,8 +79,53 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   on the hash `_id`), upsert path docs in bulk. Identical bytes pushed by N
   agents collapse to one blob server-side; renames are free; the cursor itself
   is the wire transport (no per-file roundtrips).
+- **Dirty tracking via an append-only journal.** `markDirty` appends one line to
+  `<cache>/.datastore-dirty.log` — no read, no parse, no rewrite. The JSON
+  sidecar next to it (`.datastore-sync-state.json`) holds only scalars
+  (watermarks and flags) and is rewritten only when one of them changes. On
+  push, the journal is deduped and **coalesced**: a dirty directory absorbs
+  every dirty path beneath it, since the push walks a dirty directory in full.
+  Past `MAX_DIRTY_PATHS` (10k) tracking degrades to a single full walk, which is
+  cheaper than reconciling that many roots individually.
 - **Health verifier.** Rejects non-replica-set clusters and reports
   primary/secondary state, latency, and namespace.
+
+## Maintenance
+
+- **Blob GC.** `_blobs` is append-only by design — dedup means no push can know
+  whether some other path still references a hash — so tombstoning a path leaves
+  its bytes behind. Reclaim them out of band:
+
+  ```bash
+  deno task blob-gc --repo /path/to/repo --dry-run   # always first
+  deno task blob-gc --repo /path/to/repo --confirm
+  deno task blob-gc --repo /path/to/repo --confirm --grace-minutes 120
+  ```
+
+  A push inserts a blob _before_ upserting the path doc that references it, so a
+  sweep landing between the two would delete bytes a peer is about to point at.
+  Two defenses, in order of importance:
+
+  1. **Grace window (the real one).** Blobs carry `createdAt`; anything younger
+     than `--grace-minutes` (default 60) is spared regardless of reachability.
+  2. **Global lock**, held for the sweep's duration — defense in depth only.
+     Swamp core does not funnel every write through it. A real sweep that held
+     the lock still lost one blob to a concurrent push, which is why the grace
+     window exists. Blobs written before 2026.08.19.1 have no `createdAt` and
+     are always eligible, so the first sweep after upgrading is the risky one:
+     run it when the cluster is quiet.
+
+  A dangling reference is not fatal — pull skips a path whose blob is missing,
+  and the owning host re-uploads the bytes on its next full walk, since the push
+  probes blob existence independently of the path diff. Do **not** "fix" one by
+  tombstoning the path: that deletes the owning host's local copy on its next
+  pull.
+
+- **Version retention is swamp's job, not the datastore's.** The largest sync
+  costs come from unbounded data versions, which this extension faithfully
+  mirrors. Check `garbageCollection` on your model types' output specs and run
+  `swamp data gc` — on one real repo that took `data/` from 229,598 files to
+  1,258.
 
 ## Important Information
 
@@ -116,6 +161,20 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
 - **`swamp datastore setup` can OOM on large existing `.swamp/` trees.** Swamp
   core's migrator reads the tree into memory; at ~1 GB / ~100k files it dies.
   Purge `.swamp/` first, or use `--skip-migration` and let workflows repopulate.
+- **Host-local files are never synced.** `*.db`, `*.db-wal`, `*.db-shm` (swamp's
+  SQLite catalogs) and in-flight `*.tmp.<pid>.<uuid>` staging files are excluded
+  on both legs. A `-shm` file is a mmap'd shared-memory region that means
+  nothing off the machine that made it, and both it and `-wal` churn on every
+  command — syncing them re-uploaded a blob per invocation for bytes no peer
+  could correctly consume.
+- **Two watermarks, not one.** `lastPulledAt` tracks hydrated content and drives
+  pull; `lastReconciledAt` tracks when this cache last enumerated the complete
+  remote path list and drives the push tombstone pass. They must stay separate:
+  a push stamps `updatedAt = now` on every path it writes, so those docs sort
+  newer than `lastPulledAt` and the tombstone pass — which skips anything newer,
+  to protect a peer's concurrent writes — would refuse to ever delete them. The
+  symptom is a host that cannot propagate deletion of data it pushed itself:
+  `swamp data gc` prunes locally and the remote keeps every version.
 
 ## Related
 

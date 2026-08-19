@@ -92,7 +92,9 @@ export function createLock(
 
   const collectionName = lockCollectionName(cfg);
   let myNonce: string | undefined;
-  let heartbeatTimer: number | undefined;
+  // Not `number`: the mongodb driver pulls in Node's DOM-incompatible timer
+  // typings, where setInterval returns a Timeout object.
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
   async function getCollection(): Promise<Collection<LockDoc>> {
     const { client } = await getClient(repoDir);
