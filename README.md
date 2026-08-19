@@ -166,6 +166,20 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   `swamp data gc` — on one real repo that took `data/` from 229,598 files to
   1,258. `autoGc: true` in `.swamp.yaml` did **not** keep up; schedule it.
 
+- **Run all of the above periodically.** `scripts/maintain.sh` walks every local
+  checkout using this datastore and runs `swamp data gc` then `blob-gc`, in that
+  order (the sweep only has work once gc has produced deletions):
+
+  ```bash
+  scripts/maintain.sh --dry-run     # report across all repos
+  scripts/maintain.sh --confirm
+  scripts/maintain.sh --confirm --compact
+  ```
+
+  This is the piece that prevents a repeat. The incident that motivated the
+  2026.08.19.1 rewrite was not a protocol bug — it was retention drift nobody
+  was watching.
+
 ## Important Information
 
 - **Vault secrets do not travel.** Swamp's `local_encryption` vault reads and
