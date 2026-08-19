@@ -6,7 +6,7 @@ import {
   type PathDocLike,
   sweepOrphanBlobs,
   sweepTombstones,
-} from "./maintenance.ts";
+} from "./sweeps.ts";
 
 // Minimal stand-ins for the two driver methods sweepOrphanBlobs uses.
 function fakePaths(docs: PathDocLike[]): Collection<PathDocLike> {

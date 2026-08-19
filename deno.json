@@ -14,7 +14,6 @@
     "check": "deno check extensions/datastores/mongodb/mod.ts",
     "fmt": "deno fmt",
     "lint": "deno lint",
-    "test": "deno test",
-    "blob-gc": "deno run --allow-read --allow-env --allow-net --allow-sys extensions/datastores/mongodb/blob_gc.ts"
+    "test": "deno test"
   }
 }

@@ -2,12 +2,10 @@ import { z } from "npm:zod@4";
 import { MongoClient } from "npm:mongodb@6.17.0";
 import {
   type BlobDocLike,
-  DEFAULT_GRACE_MS,
-  DEFAULT_TOMBSTONE_GRACE_MS,
   type PathDocLike,
   sweepOrphanBlobs,
   sweepTombstones,
-} from "../datastores/mongodb/maintenance.ts";
+} from "./sweeps.ts";
 
 // Maintenance surface for @keeb/mongodb-datastore, exposed as model methods so
 // it composes into swamp workflows.
@@ -16,8 +14,13 @@ import {
 // createSyncService / etc. for swamp core, and nothing a workflow can call.
 // That left reclamation as a CLI-only concern, which is the wrong shape for
 // work that should run on a schedule alongside the rest of a repo's
-// automation. This model closes that gap: the same sweep functions the CLI
-// uses, reachable from `swamp workflow run`.
+// automation. This model closes that gap.
+//
+// The sweep functions live in ./sweeps.ts rather than under
+// ../datastores/mongodb/ because packaging only ships each declared entry
+// point's transitive import graph. The datastore entry is mod.ts, which never
+// imports the sweeps, so a cross-directory import from here resolved fine
+// locally and then broke in the published tarball.
 //
 // Every method fans out over namespaces internally rather than expecting the
 // caller to loop. Looping `swamp model method run` against one model
@@ -83,7 +86,10 @@ async function withClient<T>(
   fn: (client: MongoClient) => Promise<T>,
 ): Promise<T> {
   const g = context.globalArgs;
-  const host = g.uri.match(/@?([^/@]+)(?:\/|$)/)?.[1] ?? "unknown";
+  // Host only — never the full URI, which can carry credentials. Strip the
+  // scheme and any userinfo, then stop at the path or query.
+  const host = g.uri.replace(/^[a-z+]+:\/\//i, "").replace(/^[^@/]*@/, "")
+    .split(/[/?]/)[0] || "unknown";
   context.logger.info("Connecting to MongoDB {host}", { host });
   const client = new MongoClient(g.uri, {
     auth: { username: g.username, password: g.password },
@@ -134,6 +140,23 @@ async function collStats(
   }
 }
 
+/**
+ * Model type `@keeb/mongodb-datastore/maintenance`.
+ *
+ * Reclamation surface for a MongoDB-backed swamp datastore, exposed as model
+ * methods so it composes into workflows instead of living in a script beside
+ * swamp.
+ *
+ * Methods (each fans out over every namespace in one execution):
+ * - `inventory` — live paths, tombstones, blobs, allocated vs reusable bytes,
+ *   idle days.
+ * - `sweep` — prune tombstones past their grace window and delete blobs no
+ *   live path references. Defaults to `dryRun: true`.
+ * - `compact` — return freed space to the filesystem.
+ *
+ * Global arguments carry the cluster connection; `password` is marked
+ * sensitive and should be a `vault.get(...)` expression, never a literal.
+ */
 export const model = {
   type: "@keeb/mongodb-datastore/maintenance",
   version: "2026.08.19.1",
@@ -396,5 +419,3 @@ export const model = {
     },
   },
 };
-
-export const DEFAULTS = { DEFAULT_GRACE_MS, DEFAULT_TOMBSTONE_GRACE_MS };

@@ -51,17 +51,21 @@ you're targeting.
   - `lock.ts` — TTL lock with heartbeat + nonce fencing
   - `sync.ts` — manifest + content-addressed blob sync of the datastore tier
   - `sidecar.ts` — scalar sync state + the append-only dirty journal
-  - `maintenance.ts` / `blob_gc.ts` — reclamation logic + its CLI
-    (`deno task blob-gc`)
   - `verifier.ts` — replica-set health check
 
-  `extensions/models/maintenance.ts` is the companion **model** type
-  (`@keeb/mongodb-datastore/maintenance`) wrapping the same reclamation
-  functions as `inventory` / `sweep` / `compact` methods, plus
-  `workflows/datastore-maintenance/workflow.yaml` chaining them. A
+  `extensions/models/` holds the companion **model** type
+  (`@keeb/mongodb-datastore/maintenance`): `sweeps.ts` has the reclamation
+  functions, `maintenance.ts` exposes them as `inventory` / `sweep` / `compact`,
+  and `workflows/datastore-maintenance/workflow.yaml` chains them. A
   `DatastoreProvider` exposes nothing a workflow can call, so without this,
   maintenance could only ever be a script bolted on beside swamp — which is
   exactly what SWAMP.md rules 9 and 10 say not to do.
+
+  `sweeps.ts` lives under `models/`, not `datastores/mongodb/`, because
+  packaging ships only each declared entry point's transitive import graph. The
+  datastore entry is `mod.ts`, which never imports the sweeps, so a
+  cross-directory import resolved locally and then broke in the tarball — caught
+  by `swamp extension quality`, not by `deno check`.
 
   Root `manifest.yaml` is the publishable package manifest.
 - **Secrets:** the mongo password comes from `$MONGO_PASSWORD` (env var name
@@ -106,10 +110,10 @@ you're targeting.
    watermark in order to protect a peer's concurrent writes.
 7. **`_blobs` is append-only; reclamation is out of band.** Dedup means a push
    can't tell whether another path still references a hash, so it must never
-   delete. `blob_gc.ts` sweeps unreferenced blobs, guarded by a `createdAt`
-   grace window — NOT by the global lock, which is only defense-in-depth: a real
-   sweep holding it still lost a blob to a concurrent push, so swamp core does
-   not funnel every write through it.
+   delete. The `sweep` method reclaims unreferenced blobs, guarded by a
+   `createdAt` grace window — NOT by the global lock, which is only
+   defense-in-depth: a real sweep holding it still lost a blob to a concurrent
+   push, so swamp core does not funnel every write through it.
 8. **Tombstones are load-bearing and must age out, not vanish.** They carry
    deletions to peers, so `_paths` grows without bound (855k tombstones vs 21k
    live on one repo). `sweepTombstones` hard-deletes only those past a long

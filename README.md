@@ -94,21 +94,20 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
 
 - **Blob GC.** `_blobs` is append-only by design — dedup means no push can know
   whether some other path still references a hash — so tombstoning a path leaves
-  its bytes behind. Reclaim them out of band:
+  its bytes behind.
+
+  Reclamation runs through the `sweep` method — see
+  [Run it as a workflow](#run-all-of-the-above-as-a-workflow) below. It sweeps
+  every namespace in the cluster by default, including ones whose owning
+  checkout has moved away:
 
   ```bash
-  deno task blob-gc --repo /path/to/repo --dry-run   # always first
-  deno task blob-gc --repo /path/to/repo --confirm
-  deno task blob-gc --repo /path/to/repo --confirm --grace-minutes 120
+  # Dry run is the default; nothing is deleted until you say so.
+  swamp model method run datastoreMaintenance sweep
 
-  # Operate on another repo's namespace using this repo's connection.
-  # A shared cluster accumulates namespaces whose checkout has moved away.
-  deno task blob-gc --repo /path/to/repo --list-namespaces
-  deno task blob-gc --repo /path/to/repo --namespace other-repo --dry-run
-
-  # Tombstones only — the safe pass for a namespace that is actively
-  # written and whose blobs predate `createdAt` (see below).
-  deno task blob-gc --repo /path/to/repo --namespace other --skip-blobs --confirm
+  swamp model method run datastoreMaintenance sweep --arg dryRun=false
+  swamp model method run datastoreMaintenance sweep --arg dryRun=false \
+    --arg 'namespaces=["other-repo"]' --arg skipBlobs=true
   ```
 
   A push inserts a blob _before_ upserting the path doc that references it, so a
@@ -116,7 +115,7 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   Two defenses, in order of importance:
 
   1. **Grace window (the real one).** Blobs carry `createdAt`; anything younger
-     than `--grace-minutes` (default 60) is spared regardless of reachability.
+     than `graceMinutes` (default 60) is spared regardless of reachability.
   2. **Global lock**, held for the sweep's duration — defense in depth only.
      Swamp core does not funnel every write through it. A real sweep that held
      the lock still lost one blob to a concurrent push, which is why the grace
@@ -127,8 +126,8 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   Concretely: a namespace that is **actively written** and whose blobs **all
   predate `createdAt`** has no protection at all — every unreferenced blob looks
   eligible, including one a push inserted a second ago. Either quiesce the
-  writer first, or use `--skip-blobs` to take just the tombstones (which have no
-  such race) and come back for the bytes during a maintenance window.
+  writer first, or set `skipBlobs: true` to take just the tombstones (which have
+  no such race) and come back for the bytes during a maintenance window.
 
   A dangling reference is not fatal — pull skips a path whose blob is missing,
   and the owning host re-uploads the bytes on its next full walk, since the push
@@ -136,29 +135,35 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   tombstoning the path: that deletes the owning host's local copy on its next
   pull.
 
-- **Tombstone pruning.** Runs as part of `blob-gc` (disable with
-  `--skip-tombstones`). A tombstone is how a deletion reaches peers — pull sees
-  `deletedAt` and unlinks the local copy — so `_paths` accumulates them forever.
-  On one real repo they were 855,438 docs against 21,171 live.
+- **Tombstone pruning.** Always runs as part of `sweep`, before the blob pass —
+  tombstones are not blob references, so dropping them never strands bytes, and
+  doing it first lets the blob pass collect whatever they were the last trace
+  of. A tombstone is how a deletion reaches peers — pull sees `deletedAt` and
+  unlinks the local copy — so `_paths` accumulates them forever. On one real
+  repo they were 855,438 docs against 21,171 live.
 
   Pruned tombstones are hard-deleted, which makes the deletion **invisible**: a
   peer whose `lastPulledAt` predates it never learns the file is gone and will
-  re-upload it on its next full walk. The grace window (`--tombstone-days`,
+  re-upload it on its next full walk. The grace window (`tombstoneDays`,
   default 30) must therefore exceed the longest gap between any peer's syncs —
   the same trade-off as Cassandra's `gc_grace_seconds`, with the same failure
   mode if set too low. A host dormant longer than the window should be
   re-bootstrapped rather than allowed to push.
 
 - **Reclaiming disk after a sweep.** Deleting documents returns space to
-  WiredTiger's free list, not to the filesystem. `_blobs` sat at 44.4 GB
-  allocated with 44.1 GB reusable until compacted. On a replica-set primary:
+  WiredTiger's free list, not to the filesystem — a swept cluster still reports
+  its old disk usage until compacted. `_blobs` sat at 44.4 GB allocated with
+  44.1 GB reusable; compacting took it to 185 MB.
 
-  ```js
-  db.runCommand({ compact: "t_<tenant>_r_<namespace>_blobs", force: true });
+  ```bash
+  swamp model method run datastoreMaintenance compact
   ```
 
-  `force: true` is required on a primary and slows concurrent operations, so
-  schedule it. Without it, a swept cluster still reports the old disk usage.
+  The method issues `compact` with `force: true`, which is required on a
+  replica-set primary and slows concurrent operations for its duration — it is
+  the slow step of the workflow (15 minutes on a 44 GB collection), so run it
+  when the cluster is quiet. Collections holding less than `minReusableMb`
+  (default 1) are skipped.
 
 - **Version retention is swamp's job, not the datastore's.** The largest sync
   costs come from unbounded data versions, which this extension faithfully
