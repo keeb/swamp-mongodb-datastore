@@ -20,6 +20,15 @@ export const ConfigSchema = z.object({
     "Per-repo identifier used in collection prefixing (t_<tenant>_r_<namespace>_<purpose>)",
   ),
   defaultLockTtlMs: z.number().int().positive().default(30_000),
+  maxPoolSize: z.number().int().min(1).max(10_000).default(500).describe(
+    "Maximum number of connections in the driver pool. Default: 500",
+  ),
+  maxIdleTimeMS: z.number().int().min(0).default(60_000).describe(
+    "Close idle connections after this many milliseconds. 0 = never. Default: 60000 (1 min)",
+  ),
+  serverSelectionTimeoutMS: z.number().int().min(1000).default(5_000).describe(
+    "Timeout for server selection before failing. Default: 5000 (5 s)",
+  ),
 });
 
 export type MongoDatastoreConfig = z.infer<typeof ConfigSchema>;

@@ -25,10 +25,23 @@ export function createClientFactory(
       const client = new MongoClient(cfg.uri, {
         auth: { username: cfg.username, password },
         authSource: "admin",
+        maxPoolSize: cfg.maxPoolSize,
+        minPoolSize: 0,
+        maxIdleTimeMS: cfg.maxIdleTimeMS,
+        serverSelectionTimeoutMS: cfg.serverSelectionTimeoutMS,
       });
       await client.connect();
+
+      globalThis.addEventListener("beforeunload", () => {
+        client.close().catch(() => {});
+      });
+
       return { client, repoDir };
     })();
+    cached = cached.catch((err) => {
+      cached = undefined;
+      throw err;
+    });
     return cached;
   };
 }
