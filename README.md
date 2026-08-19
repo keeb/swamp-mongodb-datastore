@@ -100,6 +100,15 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   deno task blob-gc --repo /path/to/repo --dry-run   # always first
   deno task blob-gc --repo /path/to/repo --confirm
   deno task blob-gc --repo /path/to/repo --confirm --grace-minutes 120
+
+  # Operate on another repo's namespace using this repo's connection.
+  # A shared cluster accumulates namespaces whose checkout has moved away.
+  deno task blob-gc --repo /path/to/repo --list-namespaces
+  deno task blob-gc --repo /path/to/repo --namespace other-repo --dry-run
+
+  # Tombstones only — the safe pass for a namespace that is actively
+  # written and whose blobs predate `createdAt` (see below).
+  deno task blob-gc --repo /path/to/repo --namespace other --skip-blobs --confirm
   ```
 
   A push inserts a blob _before_ upserting the path doc that references it, so a
@@ -114,6 +123,12 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
      window exists. Blobs written before 2026.08.19.1 have no `createdAt` and
      are always eligible, so the first sweep after upgrading is the risky one:
      run it when the cluster is quiet.
+
+  Concretely: a namespace that is **actively written** and whose blobs **all
+  predate `createdAt`** has no protection at all — every unreferenced blob looks
+  eligible, including one a push inserted a second ago. Either quiesce the
+  writer first, or use `--skip-blobs` to take just the tombstones (which have no
+  such race) and come back for the bytes during a maintenance window.
 
   A dangling reference is not fatal — pull skips a path whose blob is missing,
   and the owning host re-uploads the bytes on its next full walk, since the push

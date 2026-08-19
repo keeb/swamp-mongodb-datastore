@@ -21,6 +21,9 @@
 //   deno task blob-gc --repo <path> --confirm --tombstone-days 60
 //   deno task blob-gc --repo <path> --confirm --skip-tombstones
 //
+//   deno task blob-gc --repo <path> --list-namespaces
+//   deno task blob-gc --repo <path> --namespace other-repo --dry-run
+//
 // Always run --dry-run first against a shared cluster.
 
 import { parseArgs } from "jsr:@std/cli@1/parse-args";
@@ -75,9 +78,21 @@ async function readDatastoreConfig(
 
 async function main(): Promise<number> {
   const args = parseArgs(Deno.args, {
-    string: ["repo", "grace-minutes", "tombstone-days"],
-    boolean: ["dry-run", "confirm", "skip-tombstones"],
-    default: { "dry-run": false, confirm: false, "skip-tombstones": false },
+    string: ["repo", "grace-minutes", "tombstone-days", "namespace"],
+    boolean: [
+      "dry-run",
+      "confirm",
+      "skip-tombstones",
+      "skip-blobs",
+      "list-namespaces",
+    ],
+    default: {
+      "dry-run": false,
+      confirm: false,
+      "skip-tombstones": false,
+      "skip-blobs": false,
+      "list-namespaces": false,
+    },
   });
   const repoDir = args.repo ?? Deno.cwd();
   const dryRun = args["dry-run"] || !args.confirm;
@@ -94,9 +109,39 @@ async function main(): Promise<number> {
     throw new Error(`--tombstone-days must be a non-negative number`);
   }
 
-  const cfg = await readDatastoreConfig(repoDir);
+  const base = await readDatastoreConfig(repoDir);
   await loadDotEnv(repoDir);
+
+  // --namespace retargets the sweep at a different repo's collections using
+  // this repo's connection + credentials. A shared cluster accumulates
+  // namespaces whose owning checkout has moved or been retired; without this
+  // there is no way to reclaim their space short of recreating the repo.
+  const cfg: MongoDatastoreConfig = args.namespace !== undefined
+    ? { ...base, namespace: args.namespace }
+    : base;
   const getClient = createClientFactory(cfg);
+
+  if (args["list-namespaces"]) {
+    const { client } = await getClient(repoDir);
+    const db = client.db(cfg.database);
+    const seen = new Map<string, { paths: number; blobs: number }>();
+    for (
+      const c of await db.listCollections({}, { nameOnly: true }).toArray()
+    ) {
+      const m = c.name.match(/^t_(.+?)_r_(.+)_(paths|blobs)$/);
+      if (!m) continue;
+      const key = `${m[1]}/${m[2]}`;
+      const entry = seen.get(key) ?? { paths: 0, blobs: 0 };
+      const n = await db.collection(c.name).estimatedDocumentCount();
+      if (m[3] === "paths") entry.paths = n;
+      else entry.blobs = n;
+      seen.set(key, entry);
+    }
+    for (const [k, v] of [...seen].sort()) {
+      console.log(`${k}\tpaths=${v.paths}\tblobs=${v.blobs}`);
+    }
+    return 0;
+  }
 
   // Exclude every peer writer for the duration of the sweep.
   const lock = createLock(cfg, getClient, repoDir, { ttlMs: 120_000 });
@@ -127,23 +172,32 @@ async function main(): Promise<number> {
       console.log(JSON.stringify(tombstones, null, 2));
     }
 
-    console.log(
-      `${mode}sweeping blobs, grace ${Math.round(graceMs / 60_000)}m…`,
-    );
-    const res = await sweepOrphanBlobs(paths, blobs, {
-      dryRun,
-      graceMs,
-      onProgress: (n) => console.log(`  scanned ${n} blob docs…`),
-    });
+    // --skip-blobs leaves bytes alone. Worth it against a namespace that is
+    // actively written AND predates `createdAt`: with no timestamps to age
+    // against, every unreferenced blob looks eligible, including one a push
+    // inserted a second ago. Tombstone pruning has no such race, so a
+    // tombstone-only pass is the safe maintenance option there.
+    if (args["skip-blobs"]) {
+      console.log(`${mode}skipping blob sweep (--skip-blobs).`);
+    } else {
+      console.log(
+        `${mode}sweeping blobs, grace ${Math.round(graceMs / 60_000)}m…`,
+      );
+      const res = await sweepOrphanBlobs(paths, blobs, {
+        dryRun,
+        graceMs,
+        onProgress: (n) => console.log(`  scanned ${n} blob docs…`),
+      });
 
-    console.log(JSON.stringify(
-      {
-        ...res,
-        bytesReclaimedHuman: fmtBytes(res.bytesReclaimed),
-      },
-      null,
-      2,
-    ));
+      console.log(JSON.stringify(
+        {
+          ...res,
+          bytesReclaimedHuman: fmtBytes(res.bytesReclaimed),
+        },
+        null,
+        2,
+      ));
+    }
     if (dryRun) {
       console.log("\nDry run — nothing deleted. Re-run with --confirm.");
     }
