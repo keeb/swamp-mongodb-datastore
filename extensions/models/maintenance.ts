@@ -53,6 +53,20 @@ const NamespaceStatsSchema = z.object({
   idleDays: z.union([z.number(), z.null()]),
 });
 
+// `bytesReclaimed` is a lower bound, not an exact figure: storageSize is read
+// immediately after `compact` returns, and WiredTiger updates it on its own
+// checkpoint schedule. A pass that genuinely freed space can therefore report
+// 0 here while a later `inventory` shows the smaller collection. Treat it as
+// "at least this much"; `inventory.reusableBytes` dropping is the real signal.
+const CompactionSchema = z.object({
+  namespace: z.string(),
+  collectionsCompacted: z.number(),
+  storageBytesBefore: z.number(),
+  storageBytesAfter: z.number(),
+  bytesReclaimed: z.number(),
+  compactedAt: z.string(),
+});
+
 const SweepResultSchema = z.object({
   namespace: z.string(),
   dryRun: z.boolean(),
@@ -81,15 +95,38 @@ interface Ctx {
   ) => Promise<unknown>;
 }
 
+/**
+ * Extracts just the host[:port] from a MongoDB URI, for logging.
+ *
+ * A connection URI may embed credentials as `scheme://user:pass@host/...`, so
+ * logging the URI would leak them. This strips the scheme and any userinfo and
+ * stops at the path or query, leaving only the host.
+ */
+export function datastoreHost(uri: string): string {
+  return uri
+    .replace(/^[a-z+]+:\/\//i, "")
+    .replace(/^[^@/]*@/, "")
+    .split(/[/?]/)[0] || "unknown";
+}
+
+/**
+ * Pulls the namespace out of a prefixed collection name, or null if the name
+ * belongs to a different tenant or is not one of this datastore's collections.
+ */
+export function namespaceFromCollection(
+  collectionName: string,
+  tenantId: string,
+): string | null {
+  const re = new RegExp(`^t_${tenantId}_r_(.+)_(?:paths|blobs|locks)$`);
+  return collectionName.match(re)?.[1] ?? null;
+}
+
 async function withClient<T>(
   context: Ctx,
   fn: (client: MongoClient) => Promise<T>,
 ): Promise<T> {
   const g = context.globalArgs;
-  // Host only — never the full URI, which can carry credentials. Strip the
-  // scheme and any userinfo, then stop at the path or query.
-  const host = g.uri.replace(/^[a-z+]+:\/\//i, "").replace(/^[^@/]*@/, "")
-    .split(/[/?]/)[0] || "unknown";
+  const host = datastoreHost(g.uri);
   context.logger.info("Connecting to MongoDB {host}", { host });
   const client = new MongoClient(g.uri, {
     auth: { username: g.username, password: g.password },
@@ -112,11 +149,10 @@ async function discoverNamespaces(
   tenantId: string,
 ): Promise<string[]> {
   const db = client.db(database);
-  const re = new RegExp(`^t_${tenantId}_r_(.+)_(?:paths|blobs|locks)$`);
   const found = new Set<string>();
   for (const c of await db.listCollections({}, { nameOnly: true }).toArray()) {
-    const m = c.name.match(re);
-    if (m) found.add(m[1]);
+    const ns = namespaceFromCollection(c.name, tenantId);
+    if (ns !== null) found.add(ns);
   }
   return [...found].sort();
 }
@@ -172,6 +208,13 @@ export const model = {
     sweep: {
       description: "Result of a tombstone + orphaned-blob sweep",
       schema: SweepResultSchema,
+      lifetime: "infinite",
+      garbageCollection: 30,
+    },
+    compaction: {
+      description:
+        "Storage returned to the filesystem by a compact pass. bytesReclaimed is a lower bound — storageSize lags WiredTiger's checkpoint, so a pass that freed space may report 0.",
+      schema: CompactionSchema,
       lifetime: "infinite",
       garbageCollection: 30,
     },
@@ -380,6 +423,7 @@ export const model = {
             const p = prefix(tenantId, ns);
             let before = 0;
             let after = 0;
+            let compacted = 0;
             for (const suffix of ["paths", "blobs"]) {
               const name = `${p}_${suffix}`;
               const s = await collStats(client, database, name);
@@ -387,6 +431,7 @@ export const model = {
               before += s.storage;
               try {
                 await db.command({ compact: name, force: true });
+                compacted++;
               } catch (err) {
                 context.logger.warning("compact {name} failed: {error}", {
                   name,
@@ -395,21 +440,20 @@ export const model = {
               }
               after += (await collStats(client, database, name)).storage;
             }
-            if (before === 0) continue;
+            // Nothing held enough reusable space to be worth compacting.
+            if (compacted === 0) continue;
             context.logger.info(
               "Compacted {namespace}: {before} -> {after} bytes",
               { namespace: ns, before, after },
             );
             handles.push(
-              await context.writeResource("inventory", `${ns}-compacted`, {
+              await context.writeResource("compaction", ns, {
                 namespace: ns,
-                livePaths: 0,
-                tombstones: 0,
-                blobs: 0,
-                storageBytes: after,
-                reusableBytes: 0,
-                lastWriteAt: new Date().toISOString(),
-                idleDays: 0,
+                collectionsCompacted: compacted,
+                storageBytesBefore: before,
+                storageBytesAfter: after,
+                bytesReclaimed: before - after,
+                compactedAt: new Date().toISOString(),
               }),
             );
           }
