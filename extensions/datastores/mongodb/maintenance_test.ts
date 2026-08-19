@@ -5,6 +5,7 @@ import {
   chunkParentHash,
   type PathDocLike,
   sweepOrphanBlobs,
+  sweepTombstones,
 } from "./maintenance.ts";
 
 // Minimal stand-ins for the two driver methods sweepOrphanBlobs uses.
@@ -45,6 +46,78 @@ function fakeBlobs(docs: BlobDocLike[]): {
   } as unknown as Collection<BlobDocLike>;
   return { coll, remaining: () => store.map((d) => d._id) };
 }
+
+// Stand-in supporting the count/delete calls sweepTombstones uses.
+function fakeTombstonePaths(docs: PathDocLike[]): {
+  coll: Collection<PathDocLike>;
+  remaining: () => string[];
+} {
+  let store = [...docs];
+  const matches = (d: PathDocLike, f: Record<string, unknown>): boolean => {
+    const spec = f.deletedAt as Record<string, unknown> | null | undefined;
+    if (spec === undefined || spec === null) return true;
+    if (d.deletedAt === null) return false;
+    if ("$lt" in spec && !(d.deletedAt < (spec.$lt as Date))) return false;
+    return true;
+  };
+  const coll = {
+    countDocuments(filter: Record<string, unknown>) {
+      return Promise.resolve(store.filter((d) => matches(d, filter)).length);
+    },
+    deleteMany(filter: Record<string, unknown>) {
+      const before = store.length;
+      store = store.filter((d) => !matches(d, filter));
+      return Promise.resolve({ deletedCount: before - store.length });
+    },
+  } as unknown as Collection<PathDocLike>;
+  return { coll, remaining: () => store.map((d) => d._id).sort() };
+}
+
+Deno.test("sweepTombstones deletes only tombstones past the grace window", async () => {
+  const now = new Date("2026-08-19T00:00:00.000Z");
+  const day = 86_400_000;
+  const { coll, remaining } = fakeTombstonePaths([
+    { _id: "live", hash: "h1", deletedAt: null },
+    // 60 days dead — every peer syncing monthly has applied this.
+    { _id: "old", hash: "h2", deletedAt: new Date(now.getTime() - 60 * day) },
+    // 5 days dead — a peer that last synced a week ago still needs to see it.
+    { _id: "recent", hash: "h3", deletedAt: new Date(now.getTime() - 5 * day) },
+  ]);
+
+  const res = await sweepTombstones(coll, { now });
+  assertEquals(res.tombstonesTotal, 2);
+  assertEquals(res.tombstonesDeleted, 1);
+  assertEquals(res.tombstonesKept, 1);
+  // The live doc is untouched, and the recent tombstone still propagates.
+  assertEquals(remaining(), ["live", "recent"]);
+});
+
+Deno.test("sweepTombstones dry run counts without deleting", async () => {
+  const now = new Date("2026-08-19T00:00:00.000Z");
+  const { coll, remaining } = fakeTombstonePaths([
+    {
+      _id: "old",
+      hash: "h",
+      deletedAt: new Date(now.getTime() - 90 * 86_400_000),
+    },
+  ]);
+  const res = await sweepTombstones(coll, { now, dryRun: true });
+  assertEquals(res.tombstonesDeleted, 0);
+  assertEquals(res.deleted, false);
+  assertEquals(remaining(), ["old"]);
+});
+
+Deno.test("sweepTombstones never touches live docs even at graceMs 0", async () => {
+  const now = new Date("2026-08-19T00:00:00.000Z");
+  const { coll, remaining } = fakeTombstonePaths([
+    { _id: "live1", hash: "a", deletedAt: null },
+    { _id: "live2", hash: "b", deletedAt: null },
+    { _id: "dead", hash: "c", deletedAt: new Date(now.getTime() - 1) },
+  ]);
+  const res = await sweepTombstones(coll, { now, graceMs: 0 });
+  assertEquals(res.tombstonesDeleted, 1);
+  assertEquals(remaining(), ["live1", "live2"]);
+});
 
 Deno.test("chunkParentHash splits chunk ids, leaves bare hashes alone", () => {
   assertEquals(chunkParentHash("abc123"), null);

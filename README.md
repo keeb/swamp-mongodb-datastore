@@ -121,11 +121,35 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   tombstoning the path: that deletes the owning host's local copy on its next
   pull.
 
+- **Tombstone pruning.** Runs as part of `blob-gc` (disable with
+  `--skip-tombstones`). A tombstone is how a deletion reaches peers — pull sees
+  `deletedAt` and unlinks the local copy — so `_paths` accumulates them forever.
+  On one real repo they were 855,438 docs against 21,171 live.
+
+  Pruned tombstones are hard-deleted, which makes the deletion **invisible**: a
+  peer whose `lastPulledAt` predates it never learns the file is gone and will
+  re-upload it on its next full walk. The grace window (`--tombstone-days`,
+  default 30) must therefore exceed the longest gap between any peer's syncs —
+  the same trade-off as Cassandra's `gc_grace_seconds`, with the same failure
+  mode if set too low. A host dormant longer than the window should be
+  re-bootstrapped rather than allowed to push.
+
+- **Reclaiming disk after a sweep.** Deleting documents returns space to
+  WiredTiger's free list, not to the filesystem. `_blobs` sat at 44.4 GB
+  allocated with 44.1 GB reusable until compacted. On a replica-set primary:
+
+  ```js
+  db.runCommand({ compact: "t_<tenant>_r_<namespace>_blobs", force: true });
+  ```
+
+  `force: true` is required on a primary and slows concurrent operations, so
+  schedule it. Without it, a swept cluster still reports the old disk usage.
+
 - **Version retention is swamp's job, not the datastore's.** The largest sync
   costs come from unbounded data versions, which this extension faithfully
   mirrors. Check `garbageCollection` on your model types' output specs and run
   `swamp data gc` — on one real repo that took `data/` from 229,598 files to
-  1,258.
+  1,258. `autoGc: true` in `.swamp.yaml` did **not** keep up; schedule it.
 
 ## Important Information
 

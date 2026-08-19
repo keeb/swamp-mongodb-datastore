@@ -98,9 +98,18 @@ you're targeting.
    watermark in order to protect a peer's concurrent writes.
 7. **`_blobs` is append-only; reclamation is out of band.** Dedup means a push
    can't tell whether another path still references a hash, so it must never
-   delete. `blob_gc.ts` sweeps unreferenced blobs while holding the global lock
-   — required, since a push inserts a blob before the path doc that references
-   it.
+   delete. `blob_gc.ts` sweeps unreferenced blobs, guarded by a `createdAt`
+   grace window — NOT by the global lock, which is only defense-in-depth: a real
+   sweep holding it still lost a blob to a concurrent push, so swamp core does
+   not funnel every write through it.
+8. **Tombstones are load-bearing and must age out, not vanish.** They carry
+   deletions to peers, so `_paths` grows without bound (855k tombstones vs 21k
+   live on one repo). `sweepTombstones` hard-deletes only those past a long
+   grace window (default 30d) — pruning a tombstone a peer hasn't seen makes the
+   deletion invisible and lets that peer resurrect the file.
+9. **Deleting documents does not free disk.** WiredTiger keeps the space on a
+   free list; `compact` (with `force: true` on a primary) is what returns it to
+   the filesystem.
 
 ## Verification
 

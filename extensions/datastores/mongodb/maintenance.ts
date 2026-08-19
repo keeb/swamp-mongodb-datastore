@@ -45,6 +45,13 @@ export interface PathDocLike {
   deletedAt: Date | null;
 }
 
+// Order matters when running both sweeps: prune tombstones FIRST, then sweep
+// blobs. A tombstone is not a blob reference, so dropping tombstones never
+// strands bytes — but doing it first means the blob sweep's single pass also
+// collects whatever those tombstones were the last trace of.
+export const SWEEP_ORDER_NOTE =
+  "Run sweepTombstones before sweepOrphanBlobs; tombstones are not blob references.";
+
 export interface OrphanSweepResult {
   liveHashes: number;
   blobDocsScanned: number;
@@ -60,6 +67,67 @@ export interface OrphanSweepResult {
 // One hour: comfortably longer than the gap between a push's blob insert and
 // its path upsert, even for a push moving hundreds of MB.
 export const DEFAULT_GRACE_MS = 60 * 60 * 1000;
+
+// 30 days. See sweepTombstones for why this cannot be short.
+export const DEFAULT_TOMBSTONE_GRACE_MS = 30 * 24 * 60 * 60 * 1000;
+
+export interface TombstoneSweepResult {
+  tombstonesTotal: number;
+  tombstonesDeleted: number;
+  tombstonesKept: number;
+  cutoff: string;
+  deleted: boolean;
+}
+
+// Hard-deletes tombstoned path docs older than the grace window.
+//
+// A tombstone is how a deletion reaches peers: pullChanged sees
+// `deletedAt != null` and unlinks the local copy. That makes tombstones
+// load-bearing, and `_paths` accumulates them forever — on proxmox-manager,
+// 855,438 tombstones against 21,171 live docs, so 97.6% of the collection was
+// bookkeeping for deletions that every peer had long since applied.
+//
+// **The grace window is not optional.** Hard-deleting a tombstone makes the
+// deletion invisible: a peer whose `lastPulledAt` predates it never learns the
+// file is gone, keeps its local copy, and re-uploads it on its next full walk
+// — resurrecting deleted data. The window must therefore exceed the longest
+// plausible gap between a peer's syncs. This is the same trade-off as
+// Cassandra's `gc_grace_seconds`, and the same failure mode if set too low.
+//
+// Default 30 days: any host syncing at least monthly is safe. A host dormant
+// longer than the window should be re-bootstrapped (clear its cache) rather
+// than allowed to push stale state.
+export async function sweepTombstones(
+  paths: Collection<PathDocLike>,
+  opts?: {
+    dryRun?: boolean;
+    graceMs?: number;
+    now?: Date;
+  },
+): Promise<TombstoneSweepResult> {
+  const dryRun = opts?.dryRun === true;
+  const graceMs = opts?.graceMs ?? DEFAULT_TOMBSTONE_GRACE_MS;
+  const cutoff = new Date((opts?.now ?? new Date()).getTime() - graceMs);
+
+  const tombstonesTotal = await paths.countDocuments({
+    deletedAt: { $ne: null },
+  });
+  const eligible = await paths.countDocuments({
+    deletedAt: { $ne: null, $lt: cutoff },
+  });
+
+  if (!dryRun && eligible > 0) {
+    await paths.deleteMany({ deletedAt: { $ne: null, $lt: cutoff } });
+  }
+
+  return {
+    tombstonesTotal,
+    tombstonesDeleted: dryRun ? 0 : eligible,
+    tombstonesKept: tombstonesTotal - eligible,
+    cutoff: cutoff.toISOString(),
+    deleted: !dryRun,
+  };
+}
 
 // Chunked blobs store a header under the bare hash and chunks under
 // `<hash>:<n>`. A chunk is an orphan exactly when its header's hash is.

@@ -11,10 +11,15 @@
 // path doc pointing at it, so an unlocked sweep can delete bytes a peer is
 // about to reference.
 //
+// Also prunes tombstoned path docs past their own (much longer) grace window —
+// `_paths` accumulates them forever, and they can dwarf the live set.
+//
 // Usage (from a repo whose .swamp.yaml selects @keeb/mongodb-datastore):
 //
 //   deno task blob-gc --repo <path-to-repo> --dry-run
 //   deno task blob-gc --repo <path-to-repo> --confirm
+//   deno task blob-gc --repo <path> --confirm --tombstone-days 60
+//   deno task blob-gc --repo <path> --confirm --skip-tombstones
 //
 // Always run --dry-run first against a shared cluster.
 
@@ -32,8 +37,10 @@ import { createLock } from "./lock.ts";
 import {
   type BlobDocLike,
   DEFAULT_GRACE_MS,
+  DEFAULT_TOMBSTONE_GRACE_MS,
   type PathDocLike,
   sweepOrphanBlobs,
+  sweepTombstones,
 } from "./maintenance.ts";
 
 function fmtBytes(n: number): string {
@@ -68,9 +75,9 @@ async function readDatastoreConfig(
 
 async function main(): Promise<number> {
   const args = parseArgs(Deno.args, {
-    string: ["repo", "grace-minutes"],
-    boolean: ["dry-run", "confirm"],
-    default: { "dry-run": false, confirm: false },
+    string: ["repo", "grace-minutes", "tombstone-days"],
+    boolean: ["dry-run", "confirm", "skip-tombstones"],
+    default: { "dry-run": false, confirm: false, "skip-tombstones": false },
   });
   const repoDir = args.repo ?? Deno.cwd();
   const dryRun = args["dry-run"] || !args.confirm;
@@ -79,6 +86,12 @@ async function main(): Promise<number> {
     : DEFAULT_GRACE_MS;
   if (!Number.isFinite(graceMs) || graceMs < 0) {
     throw new Error(`--grace-minutes must be a non-negative number`);
+  }
+  const tombstoneMs = args["tombstone-days"] !== undefined
+    ? Number(args["tombstone-days"]) * 86_400_000
+    : DEFAULT_TOMBSTONE_GRACE_MS;
+  if (!Number.isFinite(tombstoneMs) || tombstoneMs < 0) {
+    throw new Error(`--tombstone-days must be a non-negative number`);
   }
 
   const cfg = await readDatastoreConfig(repoDir);
@@ -95,10 +108,27 @@ async function main(): Promise<number> {
     const paths = db.collection<PathDocLike>(pathsCollectionName(cfg));
     const blobs = db.collection<BlobDocLike>(blobsCollectionName(cfg));
 
+    const mode = dryRun ? "(dry run) " : "";
+
+    // Tombstones first: they are not blob references, so pruning them never
+    // strands bytes, and it lets the blob sweep's single pass collect anything
+    // they were the last trace of.
+    let tombstones = null;
+    if (!args["skip-tombstones"]) {
+      console.log(
+        `${mode}pruning tombstones older than ${
+          Math.round(tombstoneMs / 86_400_000)
+        }d…`,
+      );
+      tombstones = await sweepTombstones(paths, {
+        dryRun,
+        graceMs: tombstoneMs,
+      });
+      console.log(JSON.stringify(tombstones, null, 2));
+    }
+
     console.log(
-      `${dryRun ? "sweeping (dry run)" : "sweeping"}, grace ${
-        Math.round(graceMs / 60_000)
-      }m…`,
+      `${mode}sweeping blobs, grace ${Math.round(graceMs / 60_000)}m…`,
     );
     const res = await sweepOrphanBlobs(paths, blobs, {
       dryRun,
